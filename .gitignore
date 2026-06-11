@@ -1,0 +1,18 @@
+# Local development docs — PRDs, specs, tickets (not versioned)
+docs/
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Chopsticks local artifacts
+*.sqlite
+*.sqlite-journal
+db.sqlite*
