@@ -11,3 +11,6 @@ pub mod chopsticks;
 pub mod contracts;
 pub mod render;
 pub mod views;
+
+#[cfg(test)]
+mod fixtures;
