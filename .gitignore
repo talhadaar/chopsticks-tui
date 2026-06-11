@@ -1,0 +1,20 @@
+# Local development docs — PRDs, specs, tickets (not versioned)
+docs/
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Claude Code local settings (not checked in)
+.claude/settings.local.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Chopsticks local artifacts
+*.sqlite
+*.sqlite-journal
+db.sqlite*
