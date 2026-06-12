@@ -5,12 +5,12 @@ spawn (or attach to) a [Chopsticks](https://github.com/AcalaNetwork/chopsticks)
 fork, pin storage items, build blocks and send guided transactions, and watch the
 pinned values change column-by-column with diffs.
 
-> **Status:** MVP-1 in progress. The module layer (chain client, storage catalog,
-> rendering, diff, and the TUI views) is built and tested; the app orchestration
-> that wires them into the interactive loop (ticket T14) is not merged yet, so
-> `cargo run` currently shows the scaffold screen. See
-> [`docs/superpowers/MVP-1/`](docs/superpowers/MVP-1/) for the spec, contracts, and
-> tickets.
+> **Status:** MVP-1 feature-complete. The full loop is wired — connection screen →
+> spawn/attach a fork → pinned storage grid with diffs → build blocks and send
+> guided transactions. `cargo run` launches the interactive app. The end-to-end
+> harness (run with `--ignored`, see below) validates the loop against a live fork.
+> See [`docs/superpowers/MVP-1/`](docs/superpowers/MVP-1/) for the spec, contracts,
+> and tickets.
 
 ## Prerequisites
 
@@ -58,10 +58,9 @@ cargo run
 
 ### Running against a fork
 
-Once the connection screen (T13) and app loop (T14) are wired, you will choose to
-**spawn** a fork or **attach** to a running one from inside the TUI. To run a fork
-manually for development or for the `--ignored` tests, start Chopsticks in manual
-build mode:
+From the connection screen you choose to **spawn** a fork or **attach** to a running
+one. To run a fork manually for development or for the `--ignored` e2e tests, start
+Chopsticks in manual build mode:
 
 ```sh
 # Polkadot fork on ws://localhost:8000, blocks built only on demand
