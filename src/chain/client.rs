@@ -10,6 +10,7 @@ use futures::stream::BoxStream;
 use subxt::rpcs::client::rpc_params;
 use subxt::{Metadata, OnlineClient, PolkadotConfig, rpcs::RpcClient};
 
+use crate::chain::{blocks, dev_rpc, storage_fetch};
 use crate::contracts::{
     BlockHash, BlockRef, CellState, ChainClient, PinnedItem, PreparedTx, RenderCtx, Result,
     TxOutcome, WsEndpoint,
@@ -87,19 +88,19 @@ impl ChainClient for SubxtChainClient {
     }
 
     fn subscribe_blocks(&self) -> BoxStream<'static, Result<BlockRef>> {
-        todo!("T04: blocks().subscribe_best() mapped to BlockRef")
+        blocks::subscribe(self.inner())
     }
 
-    async fn fetch_pinned(&self, _item: &PinnedItem, _at: BlockHash) -> Result<CellState> {
-        todo!("T06: dynamic storage fetch + decode")
+    async fn fetch_pinned(&self, item: &PinnedItem, at: BlockHash) -> Result<CellState> {
+        storage_fetch::fetch(self.inner(), item, at).await
     }
 
     async fn build_block(&self) -> Result<BlockRef> {
-        todo!("T12: dev_newBlock")
+        dev_rpc::new_block(self.rpc()).await
     }
 
-    async fn submit(&self, _tx: PreparedTx) -> Result<TxOutcome> {
-        todo!("T12: sign/mock-sign + submit + decode outcome")
+    async fn submit(&self, tx: PreparedTx) -> Result<TxOutcome> {
+        dev_rpc::submit(self.inner(), tx).await
     }
 
     fn rpc(&self) -> &RpcClient {
@@ -186,6 +187,28 @@ mod tests {
         assert_eq!(ctx.ss58_prefix, 42);
         assert_eq!(ctx.token_decimals, 12);
         assert_eq!(ctx.token_symbol, "UNIT");
+    }
+
+    /// Compile-level guarantee that `inner()` and the three sibling free fns
+    /// exist with the exact signatures the delegations (and T04/T06/T12) rely on.
+    /// The helper is never called — it only has to *type-check*, which it can't
+    /// unless every path, argument type, and return type lines up, so the
+    /// `todo!()` stubs in those modules can't silently drift out of shape.
+    #[allow(dead_code, unreachable_code, clippy::diverging_sub_expression)]
+    async fn delegation_surface_typechecks(
+        client: &SubxtChainClient,
+        item: &PinnedItem,
+        at: BlockHash,
+        tx: PreparedTx,
+    ) {
+        // `inner()` returns `&OnlineClient<PolkadotConfig>`.
+        let inner: &OnlineClient<PolkadotConfig> = client.inner();
+
+        // Each binding pins the free fn's exact return type.
+        let _subscribe: BoxStream<'static, Result<BlockRef>> = blocks::subscribe(inner);
+        let _fetch: Result<CellState> = storage_fetch::fetch(inner, item, at).await;
+        let _new_block: Result<BlockRef> = dev_rpc::new_block(client.rpc()).await;
+        let _submit: Result<TxOutcome> = dev_rpc::submit(inner, tx).await;
     }
 
     #[test]
