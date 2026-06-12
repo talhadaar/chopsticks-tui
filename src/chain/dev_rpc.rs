@@ -2,20 +2,277 @@
 //!
 //! Backs `SubxtChainClient::build_block` (`dev_newBlock`) and `submit`
 //! (dev-signed or mock-signed extrinsics, decoded into a `TxOutcome`).
+//!
+//! ## Validation status
+//! The pure mapping logic (header-number / hash parsing, dev-account → keypair,
+//! the mock signer + sentinel signature, hex helpers) is unit-tested offline.
+//! The full end-to-end submission path is NOT exercised by this crate's offline
+//! tests; the live `#[ignore]`d test asserts it against a fork.
+//!
+//! ## Cross-cutting finding from the S2 spike (action needed in `client.rs`/T03)
+//! Chopsticks 1.4.2 advertises `chainHead_v1_*`, so subxt's default backend
+//! (`CombinedBackend`) routes tx submission through
+//! `transactionWatch_v1_submitAndWatch`, which Chopsticks does **not** implement
+//! — submission hangs/fails. The S2 spike only worked by building the
+//! `OnlineClient` on the **`LegacyBackend`** (`author_submitAndWatchExtrinsic`).
+//! T04 hit the same wall for subscriptions and worked around it by polling.
+//! `submit` here is correct *given* a working backend, but end-to-end tx (and
+//! clean block subscriptions) require `client.rs` (T03) to build its
+//! `OnlineClient` on `LegacyBackend`. Tracked as a follow-up to T03.
+//!
+//! ## Impersonation (S2 spike, confirmed empirically)
+//! `--mock-signature-host` accepts a sentinel signature beginning with the magic
+//! prefix `0xdeadbeef` and filled with `0xcd`; an all-zero signature is rejected
+//! as `badProof`. See `MockSigner`.
 
-use subxt::{OnlineClient, PolkadotConfig, rpcs::RpcClient};
+use subxt::tx::{Payload, Signer};
+use subxt::utils::{AccountId32, H256, MultiSignature};
+use subxt::{OnlineClient, PolkadotConfig, rpcs::RpcClient, rpcs::client::rpc_params};
+use subxt_signer::sr25519::{Keypair, dev};
 
-use crate::contracts::{BlockRef, PreparedTx, Result, TxOutcome};
+use crate::contracts::{BlockRef, DevAccount, EventSummary, PreparedTx, Result, TxOutcome, TxSigner};
 
-/// Build one block via `dev_newBlock`. Body owned by T12.
-pub(crate) async fn new_block(_rpc: &RpcClient) -> Result<BlockRef> {
-    todo!("T12: dev_newBlock")
+/// Build one block via `dev_newBlock` and report the new head as a `BlockRef`.
+///
+/// In Chopsticks `Manual` mode this builds (and finalizes) exactly one block and
+/// returns its hash; we then read the header to recover the block number.
+pub(crate) async fn new_block(rpc: &RpcClient) -> Result<BlockRef> {
+    let hash_hex: String = rpc.request("dev_newBlock", rpc_params![]).await?;
+    let hash = parse_block_hash(&hash_hex)?;
+
+    let header: serde_json::Value = rpc.request("chain_getHeader", rpc_params![hash_hex]).await?;
+    let number = parse_header_number(&header)?;
+
+    Ok(BlockRef { number, hash })
 }
 
-/// Sign/mock-sign, submit, and decode the outcome. Body owned by T12.
-pub(crate) async fn submit(
-    _inner: &OnlineClient<PolkadotConfig>,
-    _tx: PreparedTx,
-) -> Result<TxOutcome> {
-    todo!("T12: sign/mock-sign + submit + decode outcome")
+/// Submit a prepared extrinsic and resolve once it is included, decoding the
+/// outcome. A dispatch failure is a normal `Ok(TxOutcome { success: false, .. })`,
+/// not an `Err`.
+///
+/// NOTE (Manual mode): this awaits inclusion, which in `Manual` build mode only
+/// happens once a block is built. The caller (T14) is responsible for triggering
+/// `build_block` after `submit`; otherwise this future will not resolve.
+pub(crate) async fn submit(inner: &OnlineClient<PolkadotConfig>, tx: PreparedTx) -> Result<TxOutcome> {
+    let payload = subxt::dynamic::transaction(tx.pallet.clone(), tx.call.clone(), tx.args.clone());
+    match &tx.signer {
+        TxSigner::Dev(account) => submit_with(inner, &payload, &dev_keypair(*account)).await,
+        TxSigner::Impersonate(account) => {
+            submit_with(inner, &payload, &MockSigner::new(*account)).await
+        }
+    }
+}
+
+/// Submit `payload` signed by `signer`, await inclusion, and decode the outcome.
+async fn submit_with<P, S>(
+    inner: &OnlineClient<PolkadotConfig>,
+    payload: &P,
+    signer: &S,
+) -> Result<TxOutcome>
+where
+    P: Payload,
+    S: Signer<PolkadotConfig>,
+{
+    let in_block = inner
+        .tx()
+        .await?
+        .sign_and_submit_then_watch_default(payload, signer)
+        .await?
+        .wait_for_finalized()
+        .await?;
+
+    match in_block.wait_for_success().await {
+        Ok(events) => Ok(TxOutcome {
+            success: true,
+            events: summarize_events(&events),
+            error: None,
+        }),
+        Err(err) => {
+            // Dispatch failure (e.g. ExtrinsicFailed): surface it inline, still
+            // reporting whatever events were emitted.
+            let events = in_block
+                .fetch_events()
+                .await
+                .map(|evs| summarize_events(&evs))
+                .unwrap_or_default();
+            Ok(TxOutcome { success: false, events, error: Some(err.to_string()) })
+        }
+    }
+}
+
+/// Map a `DevAccount` to its well-known sr25519 dev keypair.
+fn dev_keypair(account: DevAccount) -> Keypair {
+    match account {
+        DevAccount::Alice => dev::alice(),
+        DevAccount::Bob => dev::bob(),
+        DevAccount::Charlie => dev::charlie(),
+        DevAccount::Dave => dev::dave(),
+        DevAccount::Eve => dev::eve(),
+        DevAccount::Ferdie => dev::ferdie(),
+    }
+}
+
+/// A signer that claims to be `account` and emits the sentinel signature that
+/// Chopsticks' `--mock-signature-host` accepts: 64 bytes starting with the magic
+/// prefix `0xdeadbeef`, the remainder filled with `0xcd`. (An all-zero signature
+/// is rejected as `badProof` — confirmed by the S2 spike.) Only valid against a
+/// fork spawned with `--mock-signature-host`.
+struct MockSigner {
+    account: AccountId32,
+}
+
+impl MockSigner {
+    fn new(account: AccountId32) -> Self {
+        Self { account }
+    }
+}
+
+/// The sentinel sr25519 signature Chopsticks' mock-signature-host recognises.
+fn mock_signature_bytes() -> [u8; 64] {
+    let mut sig = [0xcdu8; 64];
+    sig[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    sig
+}
+
+impl Signer<PolkadotConfig> for MockSigner {
+    fn account_id(&self) -> AccountId32 {
+        self.account
+    }
+
+    fn sign(&self, _signer_payload: &[u8]) -> MultiSignature {
+        MultiSignature::Sr25519(mock_signature_bytes())
+    }
+}
+
+/// Summarize decoded events into compact `EventSummary`s.
+fn summarize_events(events: &subxt::extrinsics::ExtrinsicEvents<PolkadotConfig>) -> Vec<EventSummary> {
+    events
+        .iter()
+        .filter_map(|e| e.ok())
+        .map(|ev| EventSummary {
+            pallet: ev.pallet_name().to_string(),
+            variant: ev.event_name().to_string(),
+            fields: to_hex(ev.field_bytes()),
+        })
+        .collect()
+}
+
+/// Parse a `0x`-prefixed 32-byte hash string into an `H256`.
+fn parse_block_hash(s: &str) -> Result<H256> {
+    let bytes = from_hex(s)?;
+    if bytes.len() != 32 {
+        anyhow::bail!("expected a 32-byte block hash, got {} bytes", bytes.len());
+    }
+    Ok(H256::from_slice(&bytes))
+}
+
+/// Parse the `number` field of an RPC block header (a hex string) into a `u32`.
+fn parse_header_number(header: &serde_json::Value) -> Result<u32> {
+    let raw = header
+        .get("number")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| anyhow::anyhow!("header missing a string `number` field"))?;
+    let n = u64::from_str_radix(raw.trim_start_matches("0x"), 16)?;
+    Ok(n as u32)
+}
+
+/// Encode bytes as a `0x`-prefixed lowercase hex string (no extra deps).
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(2 + bytes.len() * 2);
+    s.push_str("0x");
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Decode a hex string (with or without `0x`) into bytes.
+fn from_hex(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim_start_matches("0x");
+    if !s.len().is_multiple_of(2) {
+        anyhow::bail!("odd-length hex string");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(Into::into))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_header_number_decodes_hex() {
+        let header = serde_json::json!({ "number": "0x1e2" });
+        assert_eq!(parse_header_number(&header).unwrap(), 0x1e2);
+    }
+
+    #[test]
+    fn parse_header_number_rejects_missing_field() {
+        assert!(parse_header_number(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn hex_roundtrips() {
+        let bytes = [0x00u8, 0x1f, 0xa0, 0xff];
+        assert_eq!(to_hex(&bytes), "0x001fa0ff");
+        assert_eq!(from_hex("0x001fa0ff").unwrap(), bytes);
+        assert_eq!(from_hex("001fa0ff").unwrap(), bytes);
+        assert!(from_hex("0xabc").is_err());
+    }
+
+    #[test]
+    fn parse_block_hash_roundtrips_32_bytes() {
+        let h = H256::from_slice(&[7u8; 32]);
+        let s = to_hex(&h.0);
+        assert_eq!(parse_block_hash(&s).unwrap(), h);
+    }
+
+    #[test]
+    fn parse_block_hash_rejects_wrong_length() {
+        assert!(parse_block_hash("0xdeadbeef").is_err());
+    }
+
+    #[test]
+    fn dev_keypair_alice_has_known_account() {
+        let alice = dev_keypair(DevAccount::Alice).public_key().to_account_id();
+        let expected: AccountId32 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+            .parse()
+            .unwrap();
+        assert_eq!(alice, expected);
+    }
+
+    #[test]
+    fn mock_signer_reports_account_and_sentinel_signature() {
+        let account: AccountId32 = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+            .parse()
+            .unwrap();
+        let signer = MockSigner::new(account);
+        assert_eq!(signer.account_id(), account);
+        match signer.sign(b"anything") {
+            MultiSignature::Sr25519(sig) => {
+                assert_eq!(&sig[..4], &[0xde, 0xad, 0xbe, 0xef]);
+                assert!(sig[4..].iter().all(|&b| b == 0xcd));
+            }
+            other => panic!("expected a sentinel sr25519 signature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepared_tx_builds_dynamic_payload_without_panicking() {
+        use scale_value::Value;
+        let tx = PreparedTx {
+            pallet: "Balances".into(),
+            call: "transfer_keep_alive".into(),
+            args: vec![Value::u128(1), Value::u128(1_000)],
+            signer: TxSigner::Dev(DevAccount::Alice),
+            encoded_preview: String::new(),
+        };
+        let payload =
+            subxt::dynamic::transaction(tx.pallet.clone(), tx.call.clone(), tx.args.clone());
+        // Constructing the dynamic payload must not panic; presence is enough.
+        let _ = payload;
+        assert_eq!(tx.call, "transfer_keep_alive");
+    }
 }
