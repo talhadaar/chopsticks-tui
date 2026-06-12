@@ -4,6 +4,8 @@
 //! `subscribe_blocks`, `fetch_pinned`, and `build_block`/`submit` respectively
 //! (each delegating to `blocks`, `storage_fetch`, `dev_rpc`).
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -52,9 +54,22 @@ impl ChainClient for SubxtChainClient {
     where
         Self: Sized,
     {
-        let inner = OnlineClient::<PolkadotConfig>::from_url(&endpoint.0)
+        // Build the rpc client first, then drive the OnlineClient through the
+        // LEGACY backend. Chopsticks (1.4.x) advertises `chainHead_v1_*` but does
+        // not implement `transactionWatch_v1_submitAndWatch`, so subxt's default
+        // `CombinedBackend` cannot submit transactions or stream blocks against it.
+        // The legacy backend (`author_*` / `chain_*` RPCs) works for all of
+        // storage, subscriptions, and submission. See `dev_rpc.rs` / `blocks.rs`.
+        let rpc = RpcClient::from_url(&endpoint.0)
             .await
-            .with_context(|| format!("connecting OnlineClient to {}", endpoint.0))?;
+            .with_context(|| format!("opening rpc client to {}", endpoint.0))?;
+
+        let backend = subxt::backend::LegacyBackend::<PolkadotConfig>::builder().build(rpc.clone());
+        let inner = OnlineClient::<PolkadotConfig>::from_backend(Arc::new(backend))
+            .await
+            .with_context(|| {
+                format!("connecting OnlineClient (legacy backend) to {}", endpoint.0)
+            })?;
 
         // Metadata is per-block in subxt 0.50: pin the current finalized block and
         // read its metadata. Keep the `Arc` so we own it for the client's lifetime.
@@ -63,10 +78,6 @@ impl ChainClient for SubxtChainClient {
             .await
             .context("pinning current block for metadata")?;
         let metadata = at.metadata();
-
-        let rpc = RpcClient::from_url(&endpoint.0)
-            .await
-            .with_context(|| format!("opening rpc client to {}", endpoint.0))?;
 
         // `system_properties` is best-effort: fall back to Polkadot defaults.
         let props: serde_json::Value = rpc
