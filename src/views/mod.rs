@@ -8,4 +8,5 @@ pub mod grid;
 pub mod hint_bar;
 pub mod palette;
 pub mod picker;
+pub mod set_storage;
 pub mod tx_builder;

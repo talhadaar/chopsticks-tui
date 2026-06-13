@@ -485,6 +485,7 @@ dependencies = [
  "crossterm",
  "futures",
  "ratatui",
+ "scale-info",
  "scale-value",
  "serde",
  "serde_json",
