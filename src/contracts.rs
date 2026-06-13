@@ -22,7 +22,9 @@ pub type BlockHash = H256;
 // ---------------------------------------------------------------------------
 
 /// Stable unique id for a pinned storage item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct PinnedItemId(pub u64);
 
 /// Identifies a block in the fork.
@@ -33,7 +35,7 @@ pub struct BlockRef {
 }
 
 /// A segment of a path into a decoded value (for nested-field pinning).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PathSeg {
     Field(String),
     Index(u32),
@@ -41,17 +43,30 @@ pub enum PathSeg {
 
 /// A single map/double-map/NMap key argument, pre-encoding. Must round-trip to a
 /// `scale_value::Value` for subxt's dynamic storage API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KeyArg {
     AccountId(AccountId32),
-    U(u128),
+    /// A numeric key. Serialized as a decimal string so it round-trips through
+    /// TOML, which has no `u128` (only i64); P4 sessions persist `KeyArg`.
+    U(#[serde(with = "u128_string")] u128),
     Bytes(Vec<u8>),
     Text(String),
 }
 
+/// serde adaptor: represent a `u128` as a decimal string (TOML has no u128).
+mod u128_string {
+    pub fn serialize<S: serde::Serializer>(v: &u128, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u128, D::Error> {
+        let s = <String as serde::Deserialize>::deserialize(d)?;
+        s.parse::<u128>().map_err(serde::de::Error::custom)
+    }
+}
+
 /// A user-chosen storage item to watch. Fully specifies how to fetch it and
 /// which nested path to display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PinnedItem {
     pub id: PinnedItemId,
     pub pallet: String,
@@ -87,7 +102,7 @@ pub struct BlockColumn {
 // ---------------------------------------------------------------------------
 
 /// How Chopsticks builds blocks. MVP-1 always spawns `Manual`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BuildMode {
     Manual,
     Instant,
@@ -99,7 +114,7 @@ pub enum BuildMode {
 pub struct WsEndpoint(pub String);
 
 /// How to obtain a fork: spawn a new Chopsticks process or attach to one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ForkConfig {
     Spawn {
         chain_or_path: String,
@@ -217,7 +232,7 @@ pub enum CellDiff {
 // Transactions (contracts.md §3.6) — build: T11, submit: T12
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DevAccount {
     Alice,
     Bob,
@@ -227,24 +242,26 @@ pub enum DevAccount {
     Ferdie,
 }
 
-/// A request to write a storage value at the tip (`dev_setStorage`). Payload is
-/// refined by P2; P0 declares the minimal shape the registry/dispatch reference.
-#[derive(Debug, Clone)]
+/// A fully-prepared `dev_setStorage` write (payload refined by P2 from P0's stub).
+///
+/// The set-storage editor encodes the storage key and the new value to hex up
+/// front, so the RPC helper is a thin passthrough and this payload is
+/// `serde`-serializable for session replay (P4).
+///
+/// `key_hex` is the *hashed* storage key (what `StorageEntry::fetch_key`
+/// produces); `value_hex` is the SCALE-encoded new value. Both are
+/// `0x`-prefixed. A `None` `value_hex` deletes the key (Chopsticks treats a
+/// `null` value as a removal) — not surfaced in the MVP-2 UI yet but modelled
+/// so the type is complete.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SetStorageReq {
-    pub pallet: String,
-    pub entry: String,
-    /// The new value as scale-value JSON (P2 decides the exact encoding).
-    pub value_json: serde_json::Value,
-}
-
-/// How a `time-travel` target is specified. Parser + remaining variants owned by
-/// P4; P0 declares enough for `Command::TimeTravel` to compile.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TimeSpec {
-    /// A unix timestamp in milliseconds.
-    UnixMillis(u64),
-    /// A relative offset like `+6s` / `+1d` (P4 pins the grammar).
-    Relative(String),
+    /// `0x`-prefixed hashed storage key.
+    pub key_hex: String,
+    /// `0x`-prefixed SCALE-encoded value, or `None` to delete the key.
+    pub value_hex: Option<String>,
+    /// Human label for banners / the action log, e.g.
+    /// `System.Account(Alice).data.free = 1000 DOT`.
+    pub label: String,
 }
 
 /// How a transaction is signed. `Impersonate` requires the fork spawned with
@@ -300,8 +317,9 @@ pub enum Command {
     SetStorage(SetStorageReq),
     /// Rewind / jump the chain head to a block (P4 owns dispatch).
     SetHead(u32),
-    /// Set the chain timestamp (P4 owns dispatch).
-    TimeTravel(TimeSpec),
+    /// Set the chain timestamp (P4 owns dispatch). Payload refined from P0's
+    /// `contracts::TimeSpec` stub to the resolved `session::TimeSpec`.
+    TimeTravel(crate::session::TimeSpec),
     /// Switch the Chopsticks build mode (P3 owns dispatch).
     SetBuildMode(BuildMode),
     /// Build one block from the staged extrinsic queue (P3 owns dispatch).
@@ -335,12 +353,12 @@ mod tests {
         // Constructing each variant proves the shape compiles and is `Clone`.
         let cmds = vec![
             Command::SetStorage(SetStorageReq {
-                pallet: "System".into(),
-                entry: "Account".into(),
-                value_json: serde_json::Value::Null,
+                key_hex: "0x26aa".into(),
+                value_hex: Some("0x0100".into()),
+                label: "System.Account = …".into(),
             }),
             Command::SetHead(1030),
-            Command::TimeTravel(TimeSpec::Relative("+6s".into())),
+            Command::TimeTravel(crate::session::TimeSpec::from_epoch_ms(1_750_000_000_000, "+6s")),
             Command::SetBuildMode(BuildMode::Manual),
             Command::BuildWithQueue(vec![]),
             Command::SaveSession("snap".into()),
@@ -348,5 +366,73 @@ mod tests {
         ];
         let _again = cmds.clone();
         assert_eq!(cmds.len(), 7);
+    }
+
+    #[test]
+    fn p4_command_variants_exist() {
+        use crate::session::TimeSpec;
+        // Construct each variant to pin its shape.
+        let _ = Command::SetHead(1030);
+        let _ = Command::TimeTravel(TimeSpec::from_epoch_ms(1_750_000_000_000, "test"));
+        let _ = Command::SaveSession("my-session".to_string());
+        let _ = Command::LoadSession("my-session".to_string());
+    }
+
+    #[test]
+    fn pinned_item_round_trips_through_toml() {
+        let item = PinnedItem {
+            id: PinnedItemId(7),
+            pallet: "System".to_string(),
+            entry: "Account".to_string(),
+            keys: vec![KeyArg::U(42), KeyArg::Text("hi".to_string())],
+            path: vec![PathSeg::Field("data".to_string()), PathSeg::Index(0)],
+            label: "System.Account(42).data.0".to_string(),
+        };
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            item: PinnedItem,
+        }
+        let text = toml::to_string(&Wrap { item: item.clone() }).unwrap();
+        let back: Wrap = toml::from_str(&text).unwrap();
+        assert_eq!(back.item, item);
+    }
+
+    #[test]
+    fn build_mode_round_trips() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            m: BuildMode,
+        }
+        let text = toml::to_string(&Wrap { m: BuildMode::Instant }).unwrap();
+        let back: Wrap = toml::from_str(&text).unwrap();
+        assert_eq!(back.m, BuildMode::Instant);
+    }
+
+    #[test]
+    fn fork_config_round_trips_through_toml() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            fork: ForkConfig,
+        }
+        let fork = ForkConfig::Spawn {
+            chain_or_path: "polkadot".to_string(),
+            build_mode: BuildMode::Manual,
+            mock_signature_host: false,
+        };
+        let text = toml::to_string(&Wrap { fork: fork.clone() }).unwrap();
+        let back: Wrap = toml::from_str(&text).unwrap();
+        assert_eq!(back.fork, fork);
+    }
+
+    #[test]
+    fn set_storage_req_round_trips_through_json() {
+        let req = SetStorageReq {
+            key_hex: "0x26aa".to_string(),
+            value_hex: Some("0x0100".to_string()),
+            label: "System.Account(Alice).data.free = 1 DOT".to_string(),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: SetStorageReq = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, req);
     }
 }

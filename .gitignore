@@ -18,3 +18,4 @@ docs/
 *.sqlite
 *.sqlite-journal
 db.sqlite*
+.worktrees/

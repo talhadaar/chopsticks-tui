@@ -31,9 +31,12 @@ use crate::contracts::{
 };
 use crate::render::diff::diff_columns;
 use crate::render::value::DefaultRenderer;
+use crate::session::{self, RecordedAction, Session, SessionSource};
 use crate::views::connection::ConnectionView;
 use crate::views::grid::{GridCell, GridRow, GridView, GridViewModel};
 use crate::views::picker::StoragePicker;
+use crate::views::set_storage::{SetStorageEditor, ValueMode};
+use crate::views::build_panel::{BuildPanel, PanelAction};
 use crate::views::tx_builder::{ArgKind, ArgSpec, CallCatalog, TxBuilder};
 use crate::app::input::{KeyRouting, Mode, route_key};
 use crate::views::command_registry::{CommandRoute, LocalAction, parse_line, to_route};
@@ -85,12 +88,18 @@ pub struct AppState {
     pub build_queue: Vec<PreparedTx>,
     /// Current Chopsticks build mode (P3 owns the logic).
     pub build_mode: BuildMode,
-    /// Ordered replayable session log (P4 owns the type + persistence).
-    #[allow(dead_code)] // element type refined to RecordedAction + populated by P4
-    pub action_log: Vec<crate::contracts::Command>,
-    /// Name of the restored session, if any (P4).
-    #[allow(dead_code)] // populated by P4
+    /// Ordered replayable session log (freeze §4). P2/P3/P4 append via `record`.
+    pub action_log: Vec<RecordedAction>,
+    /// Name of the currently-restored (or just-saved) session, if any (P4).
     pub loaded_session: Option<String>,
+    /// The fork config in use, captured at connect (for session save/restore).
+    pub fork: Option<crate::contracts::ForkConfig>,
+    /// Amber off-timeline badge: `Some(n)` once the head was rewound to `n`.
+    pub off_timeline_from: Option<u32>,
+    /// Recorded actions awaiting replay during a session restore (front = next).
+    pub replay_queue: VecDeque<RecordedAction>,
+    /// Expected head height of a session being restored, for drift detection.
+    pub expected_restore_head: Option<u32>,
     pub should_quit: bool,
     next_pin_id: u64,
 }
@@ -122,6 +131,10 @@ impl AppState {
             build_mode: BuildMode::Manual,
             action_log: Vec::new(),
             loaded_session: None,
+            fork: None,
+            off_timeline_from: None,
+            replay_queue: VecDeque::new(),
+            expected_restore_head: None,
             should_quit: false,
             next_pin_id: 1,
         }
@@ -176,6 +189,160 @@ impl AppState {
         self.pinned.retain(|p| p.id != id);
     }
 
+    /// Append a state-changing dev action to the replayable log (freeze §4).
+    /// No-op-safe: callers (P2/P3/P4) invoke this in the same place they apply
+    /// the effect; it never fails.
+    pub fn record(&mut self, action: RecordedAction) {
+        self.action_log.push(action);
+    }
+
+    /// Build the session payload for the *current* state (fork + pins + baseline +
+    /// action log + head). Used both for manual saves and auto-snapshots.
+    pub fn to_session(&self, name: &str, source: SessionSource) -> Session {
+        let head = self.columns.back().map(|c| c.block.number).unwrap_or(0);
+        Session {
+            name: name.to_string(),
+            // A session with no fork is meaningless; fall back to an Attach stub
+            // so serialization never panics. Restore will surface a drift error.
+            fork: self
+                .fork
+                .clone()
+                .unwrap_or(crate::contracts::ForkConfig::Attach { url: String::new() }),
+            pins: self.pinned.clone(),
+            baseline: self.baseline,
+            actions: self.action_log.clone(),
+            head,
+            source,
+        }
+    }
+
+    /// `set-head` core (spec §7.1): snapshot-then-truncate. Saves the abandoned
+    /// future as an auto-named session, drops every column past `new_head`,
+    /// records the `SetHead` action, and raises the amber off-timeline banner.
+    /// Returns the auto-snapshot session name. The `dev_setHead` RPC + the
+    /// fresh-forward build are issued separately by the dispatch loop.
+    pub fn snapshot_and_truncate(&mut self, new_head: u32) -> Result<String> {
+        let old_tip = self.columns.back().map(|c| c.block.number).unwrap_or(new_head);
+        let snap_name = session::auto_snapshot_name(old_tip);
+
+        // 1. Snapshot the abandoned future (the full current state, head = old tip).
+        let snapshot = self.to_session(&snap_name, SessionSource::AutoSnapshot);
+        session::save_session(&snapshot)?;
+
+        // 2. Drop columns past the new head; the grid ends cleanly at new_head.
+        self.columns.retain(|c| c.block.number <= new_head);
+        self.col_offset = 0;
+        self.follow = true;
+
+        // 3. Record + raise off-timeline state.
+        self.record(RecordedAction::SetHead(new_head));
+        self.off_timeline_from = Some(new_head);
+        self.banner = Some(format!(
+            "⏳ Head rewound to #{new_head}. Abandoned future → session \"{snap_name}\"."
+        ));
+
+        Ok(snap_name)
+    }
+
+    /// Apply the in-UI-loop portion of a P4 command and return follow-up
+    /// `Command`s the dispatch loop should spawn (RPC + builds). Mirrors how
+    /// `Pin` is applied to state in the loop while a fetch is spawned. Commands
+    /// not handled here return no follow-ups.
+    pub fn on_command_local(&mut self, cmd: Command) -> Vec<Command> {
+        match cmd {
+            Command::SetHead(block) => {
+                // State effect: snapshot the future + truncate the grid. On a
+                // failed snapshot, surface the error but still re-fork.
+                if let Err(e) = self.snapshot_and_truncate(block) {
+                    self.banner = Some(format!("set-head snapshot failed: {e}"));
+                }
+                // Follow-up: the actual dev_setHead RPC re-forks the live chain;
+                // building forward then resumes via the normal block subscription.
+                vec![Command::SetHead(block)]
+            }
+            Command::TimeTravel(spec) => {
+                self.record(RecordedAction::TimeTravel(spec.clone()));
+                self.banner = Some(format!("⏳ time-travelled to {}", spec.source));
+                vec![Command::TimeTravel(spec)]
+            }
+            Command::SaveSession(name) => {
+                let session = self.to_session(&name, SessionSource::Manual);
+                match session::save_session(&session) {
+                    Ok(()) => {
+                        self.loaded_session = Some(name.clone());
+                        self.banner = Some(format!("saved session \"{name}\""));
+                    }
+                    Err(e) => self.banner = Some(format!("save failed: {e}")),
+                }
+                vec![]
+            }
+            Command::LoadSession(name) => match session::load_session(&name) {
+                Ok(session) => self.begin_restore(session),
+                Err(e) => {
+                    self.banner = Some(format!("load failed: {e}"));
+                    vec![]
+                }
+            },
+            // Non-P4 commands are not handled here.
+            _ => vec![],
+        }
+    }
+
+    /// Begin restoring a loaded session: apply the chain-independent state (pins,
+    /// baseline, name, expected head, replay queue) and emit a `Connect` to
+    /// re-fork via the existing supervisor path (`spawn_connect`). The replay
+    /// queue is drained as the re-forked chain comes up.
+    fn begin_restore(&mut self, session: Session) -> Vec<Command> {
+        self.pinned = session.pins;
+        self.baseline = session.baseline;
+        self.loaded_session = Some(session.name);
+        self.expected_restore_head = Some(session.head);
+        self.replay_queue = session.actions.into_iter().collect();
+        // Reset the live grid; the re-fork rebuilds it.
+        self.columns.clear();
+        self.col_offset = 0;
+        self.follow = true;
+        self.off_timeline_from = None;
+        self.fork = Some(session.fork.clone());
+        vec![Command::Connect(session.fork)]
+    }
+
+    /// Pop the next recorded action and translate it into the `Command` that
+    /// reproduces it, or `None` when the queue is drained. Actions with no P4
+    /// command yet (e.g. `SetStorage`/`SetBuildMode`, owned by P2/P3) are skipped,
+    /// advancing to the next replayable action.
+    pub fn drain_next_replay(&mut self) -> Option<Command> {
+        while let Some(action) = self.replay_queue.pop_front() {
+            match action {
+                RecordedAction::SetHead(b) => return Some(Command::SetHead(b)),
+                RecordedAction::TimeTravel(spec) => return Some(Command::TimeTravel(spec)),
+                // Replay a built block as an empty +6s build (advances height).
+                // Full re-staging of `extrinsics` lands when P3's tx machinery is
+                // available (see plan §"Replay scope note").
+                RecordedAction::BuiltBlock { .. } => return Some(Command::BuildBlock),
+                // P2/P3 own these commands; until full replay lands, skip (no
+                // panic, no silent corruption — the action stays in the file).
+                RecordedAction::SetStorage { .. } | RecordedAction::SetBuildMode(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// Note the head height reached during a restore; warn on base drift (spec
+    /// §8 risk / §11 open question). "Drift" = the re-forked tip differs from the
+    /// expected saved head once replay has finished advancing the chain.
+    pub fn note_restore_progress(&mut self, current_head: u32) {
+        if let Some(expected) = self.expected_restore_head
+            && self.replay_queue.is_empty()
+            && current_head != expected
+        {
+            self.banner = Some(format!(
+                "⚠ session base drift: expected head #{expected}, restored to #{current_head}"
+            ));
+            self.expected_restore_head = None;
+        }
+    }
+
     /// Scroll one column toward the past; pauses follow.
     pub fn scroll_left(&mut self) {
         let max = self.columns.len().saturating_sub(1);
@@ -199,6 +366,12 @@ impl AppState {
     pub fn jump_newest(&mut self) {
         self.col_offset = 0;
         self.follow = true;
+    }
+
+    /// Set the current build mode (UI-side; the RPC switch is dispatched
+    /// separately via `Command::SetBuildMode`). MVP-2 P3.
+    pub fn set_build_mode(&mut self, mode: BuildMode) {
+        self.build_mode = mode;
     }
 
     /// Set (or move) the baseline. `None` resolves to the newest column's block
@@ -233,14 +406,13 @@ impl AppState {
             // P1: baseline mutation, applied directly to state (no RPC).
             LocalAction::SetBaseline(block) => self.set_baseline(block),
             LocalAction::ClearBaseline => self.clear_baseline(),
-            // Deferred to later MVP-2 phases: surface feedback instead of a silent
-            // no-op, matching the RPC stubs' "not yet implemented". P4 wires up
-            // sessions.
-            LocalAction::OpenSessions => {
-                self.banner = Some("not yet implemented".into());
-            }
-            // Overlay/modal opens are performed by the loop, not by state.
-            LocalAction::OpenPicker | LocalAction::OpenTxBuilder => {}
+            // Overlay/modal opens are performed by the loop, not by state (P4
+            // wires the sessions modal open at the loop site, like the others).
+            LocalAction::OpenPicker
+            | LocalAction::OpenTxBuilder
+            | LocalAction::OpenSetStorage
+            | LocalAction::OpenBuildPanel
+            | LocalAction::OpenSessions => {}
         }
     }
 
@@ -507,9 +679,23 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
     let mut catalog: Option<&'static MetadataCatalog<'static>> = None;
     let mut picker: Option<StoragePicker<'static>> = None;
     let mut tx_builder: Option<TxBuilder<CuratedCallCatalog>> = None;
+    let mut set_storage_editor: Option<SetStorageEditor<'static>> = None;
+    let mut build_panel: Option<BuildPanel> = None;
+    let mut sessions: Option<crate::views::sessions::SessionsView> = None;
 
     loop {
-        terminal.draw(|f| render(f, &app, &renderer, picker.as_ref(), tx_builder.as_ref()))?;
+        terminal.draw(|f| {
+            render(
+                f,
+                &app,
+                &renderer,
+                picker.as_ref(),
+                tx_builder.as_ref(),
+                set_storage_editor.as_ref(),
+                build_panel.as_ref(),
+                sessions.as_ref(),
+            )
+        })?;
         if app.should_quit {
             break;
         }
@@ -517,7 +703,18 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
         tokio::select! {
             Some(ct) = key_rx.recv() => {
                 if let CtEvent::Key(key) = ct && key.kind == KeyEventKind::Press {
-                    handle_key(key, &mut app, &cmd_tx, &mut picker, &mut tx_builder, catalog);
+                    handle_key(
+                        key,
+                        &mut app,
+                        &cmd_tx,
+                        &mut picker,
+                        &mut tx_builder,
+                        &mut set_storage_editor,
+                        &mut build_panel,
+                        &mut sessions,
+                        client,
+                        catalog,
+                    );
                 }
             }
             Some(ev) = evt_rx.recv() => {
@@ -546,15 +743,33 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
             Some(block) = block_rx.recv() => {
                 match block {
                     Ok(blk) => {
+                        let number = blk.number;
                         if let Some(c) = client {
                             spawn_fetch_column(c, blk, app.pinned.clone(), evt_tx.clone());
                         }
+                        // Restore in progress: advance the replay queue one step
+                        // per new block, then check for base drift once drained.
+                        if !app.replay_queue.is_empty()
+                            && let Some(cmd) = app.drain_next_replay()
+                        {
+                            let _ = cmd_tx.send(cmd);
+                        }
+                        app.note_restore_progress(number);
                     }
                     Err(e) => { let _ = evt_tx.send(Event::Disconnected(e.to_string())); }
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
-                dispatch(cmd, client, &evt_tx, &client_tx);
+                // P4 commands have an in-loop state effect (snapshot/save/load)
+                // that also produces follow-up RPC commands; route them first.
+                let followups = if is_p4_command(&cmd) {
+                    app.on_command_local(cmd)
+                } else {
+                    vec![cmd]
+                };
+                for f in followups {
+                    dispatch(f, client, &evt_tx, &client_tx, app.pinned.clone());
+                }
             }
         }
     }
@@ -562,19 +777,64 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
 }
 
 /// Route a key to the connection screen, an open overlay, or the grid.
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     key: KeyEvent,
     app: &mut AppState,
     cmd_tx: &mpsc::UnboundedSender<Command>,
     picker: &mut Option<StoragePicker<'static>>,
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+    set_storage_editor: &mut Option<SetStorageEditor<'static>>,
+    build_panel: &mut Option<BuildPanel>,
+    sessions: &mut Option<crate::views::sessions::SessionsView>,
+    client: Option<&'static SubxtChainClient>,
     catalog: Option<&'static MetadataCatalog<'static>>,
 ) {
     // Connecting: drive the connection form (unchanged MVP-1 behavior).
     if app.phase == Phase::Connecting {
         if let Some(cmd) = app.connection.on_key(key) {
+            // Capture the fork config so session save/restore has it (P4).
+            if let Command::Connect(cfg) = &cmd {
+                app.fork = Some(cfg.clone());
+            }
             let _ = cmd_tx.send(cmd);
         }
+        return;
+    }
+
+    // Set-storage editor open: route to it ahead of grid/palette. Esc closes;
+    // a confirmed value dispatches `Command::SetStorage`.
+    if let Some(ed) = set_storage_editor.as_mut() {
+        if key.code == KeyCode::Esc {
+            *set_storage_editor = None;
+            app.mode = Mode::Normal;
+            return;
+        }
+        if let Some(cmd) = ed.on_key(key) {
+            // Action-log append seam (freeze §4): record the P2 set-storage edit
+            // here, at the &mut app site, before dispatching it off-thread. Stored
+            // as the raw edits JSON (P2 owns SetStorageReq's shape).
+            if let Command::SetStorage(req) = &cmd {
+                let value_json = match &req.value_hex {
+                    Some(v) => serde_json::Value::String(v.clone()),
+                    None => serde_json::Value::Null,
+                };
+                let edits = serde_json::json!([[&req.key_hex, value_json]]);
+                app.record(RecordedAction::SetStorage {
+                    edits_json: edits.to_string(),
+                });
+            }
+            let _ = cmd_tx.send(cmd);
+            *set_storage_editor = None;
+            app.mode = Mode::Normal;
+        }
+        return;
+    }
+
+    // Sessions modal open: route to it ahead of grid/palette (spec §8). It emits
+    // a `SessionsAction` the loop turns into IO + Commands; the loop owns IO.
+    if sessions.is_some() {
+        route_sessions_key(key, app, cmd_tx, sessions);
         return;
     }
 
@@ -594,27 +854,49 @@ fn handle_key(
             app.mode = Mode::Insert;
         }
         KeyRouting::Grid(key) => {
+            // `S` opens the sessions modal (standalone fallback before/besides the
+            // `:sessions` palette verb; mirrors how `p`/`t` open overlays directly).
+            if key.code == KeyCode::Char('S') {
+                open_sessions(app, sessions);
+                return;
+            }
             for cmd in app.on_key(key) {
                 let _ = cmd_tx.send(cmd);
             }
         }
         KeyRouting::Palette(key) => {
-            handle_palette_key(key, app, cmd_tx, picker, tx_builder, catalog);
+            handle_palette_key(
+                key,
+                app,
+                cmd_tx,
+                picker,
+                tx_builder,
+                set_storage_editor,
+                build_panel,
+                sessions,
+                client,
+                catalog,
+            );
         }
         KeyRouting::Overlay(key) => {
-            handle_overlay_key(key, app, cmd_tx, picker, tx_builder);
+            handle_overlay_key(key, app, cmd_tx, picker, tx_builder, build_panel);
         }
     }
 }
 
 /// Feed a key to the open palette and act on its outcome. Owns the Command→Normal
 /// transition and the parse/route → dispatch-or-local plumbing.
+#[allow(clippy::too_many_arguments)]
 fn handle_palette_key(
     key: KeyEvent,
     app: &mut AppState,
     cmd_tx: &mpsc::UnboundedSender<Command>,
     picker: &mut Option<StoragePicker<'static>>,
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+    set_storage_editor: &mut Option<SetStorageEditor<'static>>,
+    build_panel: &mut Option<BuildPanel>,
+    sessions: &mut Option<crate::views::sessions::SessionsView>,
+    client: Option<&'static SubxtChainClient>,
     catalog: Option<&'static MetadataCatalog<'static>>,
 ) {
     let outcome = match app.palette.as_mut() {
@@ -651,6 +933,19 @@ fn handle_palette_key(
                             *tx_builder = Some(TxBuilder::new(CuratedCallCatalog));
                             app.mode = Mode::Insert;
                         }
+                        LocalAction::OpenSetStorage => {
+                            if let (Some(c), Some(cat)) = (client, catalog) {
+                                *set_storage_editor = Some(build_set_storage_editor(c, cat));
+                                app.mode = Mode::Insert;
+                            } else {
+                                app.banner = Some("set-storage: not connected".into());
+                            }
+                        }
+                        LocalAction::OpenBuildPanel => {
+                            *build_panel = Some(BuildPanel::new());
+                            app.mode = Mode::Insert;
+                        }
+                        LocalAction::OpenSessions => open_sessions(app, sessions),
                         other => app.apply_local(other),
                     }
                 }
@@ -671,6 +966,7 @@ fn handle_overlay_key(
     cmd_tx: &mpsc::UnboundedSender<Command>,
     picker: &mut Option<StoragePicker<'static>>,
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+    build_panel: &mut Option<BuildPanel>,
 ) {
     if let Some(p) = picker.as_mut() {
         if key.code == KeyCode::Esc {
@@ -687,18 +983,135 @@ fn handle_overlay_key(
         return;
     }
     if let Some(tb) = tx_builder.as_mut() {
+        // Esc closes the tx-builder. If a build panel is open, the tx-builder was
+        // opened from it (staging flow) — return to the panel; otherwise (the
+        // standalone `:tx` flow) return to the grid.
         if key.code == KeyCode::Esc {
             *tx_builder = None;
-            app.mode = Mode::Normal;
+            if build_panel.is_none() {
+                app.mode = Mode::Normal;
+            }
             return;
         }
         if let Some(cmd) = tb.on_key(key) {
+            // Submit-mode terminal action.
             let _ = cmd_tx.send(cmd);
+            return;
+        }
+        // Stage-mode: if a tx was just staged, hand it to the build panel and
+        // close the tx-builder (back to the panel).
+        if let Some(tx) = tb.take_staged() {
+            if let Some(bp) = build_panel.as_mut() {
+                bp.push(tx);
+            }
+            *tx_builder = None;
+        }
+        return;
+    }
+    if let Some(bp) = build_panel.as_mut() {
+        match bp.on_key(key) {
+            PanelAction::None => {}
+            PanelAction::AddExtrinsic => {
+                // Open the tx-builder in Stage mode on top of the panel; its
+                // completed tx is drained back into the panel above.
+                *tx_builder = Some(TxBuilder::new_staging(CuratedCallCatalog));
+            }
+            PanelAction::Build { queue, timestamp, author } => {
+                // Action-log append seam (freeze §4): record the P3 built block here
+                // (the &mut app site) before dispatching off-thread. The live
+                // PreparedTx has no reversible arg strings, so the record captures
+                // pallet/call/signer (replay re-advances height per §"Replay scope").
+                let extrinsics = queue
+                    .iter()
+                    .map(|tx| crate::session::PreparedTxRecord::from_parts(tx, Vec::new()))
+                    .collect();
+                app.record(RecordedAction::BuiltBlock {
+                    extrinsics,
+                    timestamp,
+                    author: author.clone(),
+                });
+                // Block metadata (timestamp/author) is display-only: the frozen
+                // BuildWithQueue(Vec<PreparedTx>) contract carries no metadata, so
+                // the dispatch helper builds with defaults. Forwarding overrides is
+                // a P0-owned contract extension (shared-contracts §3).
+                let _ = cmd_tx.send(Command::BuildWithQueue(queue));
+                *build_panel = None;
+                app.mode = Mode::Normal;
+            }
+            PanelAction::Cancel => {
+                *build_panel = None;
+                app.mode = Mode::Normal;
+            }
         }
         return;
     }
     // No overlay actually open (mode drift): snap back to Normal.
     app.mode = Mode::Normal;
+}
+
+/// Open the sessions modal over the current on-disk session list (P4). A read
+/// failure is non-fatal: open with an empty list and surface a banner.
+fn open_sessions(
+    app: &mut AppState,
+    sessions: &mut Option<crate::views::sessions::SessionsView>,
+) {
+    let list = match crate::session::list_sessions() {
+        Ok(l) => l,
+        Err(e) => {
+            app.banner = Some(format!("sessions: {e}"));
+            Vec::new()
+        }
+    };
+    *sessions = Some(crate::views::sessions::SessionsView::new(list));
+    app.mode = Mode::Insert;
+}
+
+/// Feed a key to the open sessions modal and act on its `SessionsAction` (P4).
+/// Restore/Save dispatch `Command`s the loop applies via `on_command_local`;
+/// Delete/Rename perform IO here and reopen the refreshed list.
+fn route_sessions_key(
+    key: KeyEvent,
+    app: &mut AppState,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
+    sessions: &mut Option<crate::views::sessions::SessionsView>,
+) {
+    use crate::views::sessions::SessionsAction;
+    let Some(sv) = sessions.as_mut() else { return };
+    match sv.on_key(key) {
+        Some(SessionsAction::Close) => {
+            *sessions = None;
+            app.mode = Mode::Normal;
+        }
+        Some(SessionsAction::Restore(name)) => {
+            let _ = cmd_tx.send(Command::LoadSession(name));
+            *sessions = None;
+            app.mode = Mode::Normal;
+        }
+        Some(SessionsAction::SaveCurrent) => {
+            // Derive a default name from the current head; the loop persists it.
+            let head = app.columns.back().map(|c| c.block.number).unwrap_or(0);
+            let _ = cmd_tx.send(Command::SaveSession(format!("session-#{head}")));
+            *sessions = None;
+            app.mode = Mode::Normal;
+        }
+        Some(SessionsAction::Delete(name)) => {
+            if let Err(e) = crate::session::delete_session(&name) {
+                app.banner = Some(format!("delete failed: {e}"));
+            }
+            open_sessions(app, sessions); // reopen with the refreshed list
+        }
+        Some(SessionsAction::Rename { from, to }) => {
+            // Rename = load, re-save under the new name, delete the old file.
+            if let Ok(mut s) = crate::session::load_session(&from) {
+                s.name = to.clone();
+                if crate::session::save_session(&s).is_ok() {
+                    let _ = crate::session::delete_session(&from);
+                }
+            }
+            open_sessions(app, sessions);
+        }
+        None => {}
+    }
 }
 
 /// Act on a UI command: spawn the matching background task.
@@ -707,6 +1120,7 @@ fn dispatch(
     client: Option<&'static SubxtChainClient>,
     evt_tx: &mpsc::UnboundedSender<Event>,
     client_tx: &mpsc::UnboundedSender<&'static SubxtChainClient>,
+    pinned: Vec<PinnedItem>,
 ) {
     match cmd {
         Command::Connect(cfg) => spawn_connect(cfg, evt_tx.clone(), client_tx.clone()),
@@ -746,17 +1160,102 @@ fn dispatch(
         // pinned set on each block, so nothing to spawn here.
         Command::Pin(_) | Command::Unpin(_) => {}
         Command::Quit => {}
-        // MVP-2 commands: P0 lands stub arms; owning plans replace them.
-        Command::SetStorage(_)
-        | Command::SetHead(_)
-        | Command::TimeTravel(_)
-        | Command::SetBuildMode(_)
-        | Command::BuildWithQueue(_)
-        | Command::SaveSession(_)
-        | Command::LoadSession(_) => {
-            let _ = evt_tx.send(Event::Error("not yet implemented".into()));
+        // P2: write raw storage at head (no new block), then refetch pinned items
+        // at the current head so the change lands yellow on the tip column.
+        Command::SetStorage(req) => {
+            if let Some(c) = client {
+                let rpc = c.rpc().clone();
+                let evt = evt_tx.clone();
+                tokio::spawn(async move {
+                    // Build the raw edits array `[[keyHex, valueHex]]` (a null value
+                    // would delete the key; the editor never sends that yet).
+                    let value_json = match &req.value_hex {
+                        Some(v) => serde_json::Value::String(v.clone()),
+                        None => serde_json::Value::Null,
+                    };
+                    let edits = serde_json::json!([[req.key_hex, value_json]]);
+                    if let Err(e) = dev_rpc::set_storage(&rpc, edits).await {
+                        let _ = evt.send(Event::Error(format!("set storage: {e}")));
+                        return;
+                    }
+                    match head_block_ref(c).await {
+                        Ok(head) => refetch_at_head(c, head, pinned, evt.clone()).await,
+                        Err(e) => {
+                            let _ = evt.send(Event::Error(format!("set storage refetch: {e}")));
+                        }
+                    }
+                });
+            } else {
+                let _ = evt_tx.send(Event::Error("set storage: not connected".into()));
+            }
         }
+        // MVP-2 P3: switch the Chopsticks block-build mode.
+        Command::SetBuildMode(mode) => {
+            if let Some(c) = client {
+                let rpc = c.rpc().clone();
+                let evt = evt_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dev_rpc::set_block_build_mode(&rpc, mode).await {
+                        let _ = evt.send(Event::Error(format!("set build mode: {e}")));
+                    }
+                });
+            }
+        }
+        // MVP-2 P3: build one block from the staged extrinsic queue.
+        Command::BuildWithQueue(queue) => {
+            if let Some(c) = client {
+                let inner = c.inner().clone();
+                let rpc = c.rpc().clone();
+                let evt = evt_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dev_rpc::build_with_queue(&inner, &rpc, queue).await {
+                        let _ = evt.send(Event::Error(format!("build with queue: {e}")));
+                    }
+                });
+            }
+        }
+        // MVP-2 P4: re-fork the live chain head. The state effect (snapshot +
+        // truncate) already ran in the UI loop via `on_command_local`; this arm
+        // issues the actual `dev_setHead` RPC.
+        Command::SetHead(block) => {
+            if let Some(c) = client {
+                let rpc = c.rpc().clone();
+                let evt = evt_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dev_rpc::set_head(&rpc, block).await {
+                        let _ = evt.send(Event::Error(format!("set-head: {e}")));
+                    }
+                });
+            }
+        }
+        // MVP-2 P4: set the chain timestamp.
+        Command::TimeTravel(spec) => {
+            if let Some(c) = client {
+                let rpc = c.rpc().clone();
+                let evt = evt_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dev_rpc::time_travel(&rpc, &spec).await {
+                        let _ = evt.send(Event::Error(format!("time-travel: {e}")));
+                    }
+                });
+            }
+        }
+        // P4: SaveSession/LoadSession are applied to AppState in the UI loop
+        // (via on_command_local); nothing to spawn here.
+        Command::SaveSession(_) | Command::LoadSession(_) => {}
     }
+}
+
+/// P4 commands carry an in-loop state effect handled by `AppState::on_command_local`
+/// before any RPC follow-up is dispatched.
+fn is_p4_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::SetHead(_)
+            | Command::TimeTravel(_)
+            | Command::SaveSession(_)
+            | Command::LoadSession(_)
+    )
 }
 
 /// Spawn the connect flow: start the supervisor (forwarding boot logs), connect
@@ -807,6 +1306,88 @@ fn spawn_connect(
     });
 }
 
+/// Resolve the current head as a `BlockRef` (number + hash) by pinning the
+/// current block (as `blocks::poll_head` does). After an in-place
+/// `dev_setStorage` the head number is unchanged, so the refetched column lands
+/// on the tip and diffs yellow vs the previous column (P2).
+async fn head_block_ref(
+    client: &'static SubxtChainClient,
+) -> Result<crate::contracts::BlockRef> {
+    let at = client.inner().at_current_block().await?;
+    Ok(crate::contracts::BlockRef {
+        number: at.block_number() as u32,
+        hash: at.block_hash(),
+    })
+}
+
+/// Fetch every pinned item at `head` and emit the column (same body as
+/// `spawn_fetch_column`, awaited inline so the write→refetch is sequential).
+async fn refetch_at_head(
+    client: &'static SubxtChainClient,
+    head: crate::contracts::BlockRef,
+    pinned: Vec<PinnedItem>,
+    evt_tx: mpsc::UnboundedSender<Event>,
+) {
+    let inner = client.inner().clone();
+    let mut cells = std::collections::BTreeMap::new();
+    for item in &pinned {
+        let state = storage_fetch::fetch(&inner, item, head.hash)
+            .await
+            .unwrap_or_else(|e| CellState::Undecodable {
+                raw_hex: String::new(),
+                error: e.to_string(),
+            });
+        cells.insert(item.id, state);
+    }
+    let _ = evt_tx.send(Event::NewColumn(BlockColumn { block: head, cells }));
+}
+
+/// Build a [`SetStorageEditor`] wired to the live client + metadata catalog (P2).
+///
+/// * key resolver: derives the hashed storage key offline from metadata
+///   (`storage_fetch::storage_key_hex`) and resolves the entry's value type-id
+///   (`storage_fetch::entry_value_type_id`) — both sync, no network round-trip.
+/// * text encoder: scale-value text / raw hex → `value_hex`, encoding against the
+///   resolved value type-id using the live metadata registry.
+/// * tree encoder: re-encodes the edited typed-tree value against the type-id.
+fn build_set_storage_editor(
+    client: &'static SubxtChainClient,
+    catalog: &'static MetadataCatalog<'static>,
+) -> SetStorageEditor<'static> {
+    use crate::views::set_storage::{encode_raw_hex, encode_scale_text, encode_value};
+
+    let metadata = client.metadata();
+
+    // Key resolver: offline storage-key derivation + value type-id lookup.
+    let resolve_key = move |item: &PinnedItem| -> std::result::Result<(String, u32), String> {
+        let key_hex = storage_fetch::storage_key_hex(metadata, item).map_err(|e| e.to_string())?;
+        let type_id = storage_fetch::entry_value_type_id(metadata, &item.pallet, &item.entry)
+            .map_err(|e| e.to_string())?;
+        Ok((key_hex, type_id))
+    };
+
+    // Text encoder: raw hex needs nothing; scale-value text encodes against the
+    // entry's value type-id using the live metadata registry.
+    let encode_text = move |mode, raw: &str, type_id: u32| -> std::result::Result<String, String> {
+        match mode {
+            ValueMode::RawHex => encode_raw_hex(raw),
+            ValueMode::ScaleText => encode_scale_text(raw, type_id, metadata.types()),
+            ValueMode::Tree => Err("tree mode encodes via Enter, not text".to_string()),
+        }
+    };
+
+    // Tree encoder: re-encode the whole edited decoded value against the type-id.
+    let encode_tree = move |value: &scale_value::Value<u32>,
+                            type_id: u32|
+          -> std::result::Result<String, String> {
+        encode_value(value, type_id, metadata.types())
+    };
+
+    SetStorageEditor::new(catalog, resolve_key)
+        .with_encoder(encode_text)
+        .with_tree_encoder(encode_tree)
+}
+
 /// Fetch every pinned item at `blk` and emit the resulting `BlockColumn`.
 fn spawn_fetch_column(
     client: &'static SubxtChainClient,
@@ -834,20 +1415,26 @@ fn spawn_fetch_column(
 // Rendering
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn render(
     f: &mut Frame,
     app: &AppState,
     renderer: &dyn crate::contracts::ValueRenderer,
     picker: Option<&StoragePicker<'static>>,
     tx_builder: Option<&TxBuilder<CuratedCallCatalog>>,
+    set_storage_editor: Option<&SetStorageEditor<'static>>,
+    build_panel: Option<&BuildPanel>,
+    sessions: Option<&crate::views::sessions::SessionsView>,
 ) {
     let area = f.area();
     match app.phase {
         Phase::Connecting => app.connection.render(f, area),
         Phase::Grid => {
-            // banner (optional) + grid + tx-result panel + hint bar.
+            // status line (banner OR build-mode indicator) + grid + tx-result
+            // panel + hint bar. The top line is always reserved: an error banner
+            // takes priority, otherwise it shows the current build mode.
             let chunks = Layout::vertical([
-                Constraint::Length(if app.banner.is_some() { 1 } else { 0 }),
+                Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(if app.tx_result.is_some() { 4 } else { 0 }),
                 Constraint::Length(1),
@@ -858,6 +1445,20 @@ fn render(
                 f.render_widget(
                     Paragraph::new(banner.as_str())
                         .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red)),
+                    chunks[0],
+                );
+            } else if let Some(n) = app.off_timeline_from {
+                // Amber off-timeline badge after a set-head rewind (spec §7.1).
+                f.render_widget(
+                    Paragraph::new(format!("⏳ off-timeline from #{n}"))
+                        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Yellow)),
+                    chunks[0],
+                );
+            } else {
+                // Build-mode indicator (purple = dev surface).
+                f.render_widget(
+                    Paragraph::new(format!("build-mode: {:?}", app.build_mode))
+                        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Magenta)),
                     chunks[0],
                 );
             }
@@ -886,7 +1487,16 @@ fn render(
             render_hint_bar(f, chunks[3], app.mode);
 
             // Overlays draw on top in a centered area; the palette anchors itself.
-            if let Some(p) = picker {
+            // The sessions modal takes precedence when open (spec §8).
+            if let Some(sv) = sessions {
+                let a = centered(area, 70, 70);
+                f.render_widget(Clear, a);
+                sv.render(f, a);
+            } else if let Some(ed) = set_storage_editor {
+                let a = centered(area, 70, 70);
+                f.render_widget(Clear, a);
+                ed.render(f, a);
+            } else if let Some(p) = picker {
                 let a = centered(area, 70, 70);
                 f.render_widget(Clear, a);
                 p.render(f, a);
@@ -894,6 +1504,10 @@ fn render(
                 let a = centered(area, 70, 70);
                 f.render_widget(Clear, a);
                 tb.render(f, a);
+            } else if let Some(bp) = build_panel {
+                let a = centered(area, 70, 60);
+                f.render_widget(Clear, a);
+                bp.render(f, a);
             } else if let Some(pal) = &app.palette {
                 pal.render(f, area);
             }
@@ -1163,6 +1777,25 @@ mod tests {
     }
 
     #[test]
+    fn off_timeline_badge_renders_in_grid() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        app.pinned.push(item(1, "row"));
+        app.push_column(column(1030, 1, 1));
+        app.off_timeline_from = Some(1030);
+
+        let backend = TestBackend::new(80, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let renderer = DefaultRenderer;
+        term.draw(|f| render(f, &app, &renderer, None, None, None, None, None)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("from #1030"), "off-timeline badge must render: {text}");
+    }
+
+    #[test]
     fn tx_result_populates_panel_without_touching_grid() {
         let mut app = AppState::new();
         app.phase = Phase::Grid;
@@ -1191,6 +1824,229 @@ mod tests {
         assert_eq!(app.build_mode, crate::contracts::BuildMode::Manual);
         assert!(app.action_log.is_empty());
         assert!(app.loaded_session.is_none());
+    }
+
+    use crate::session::SessionSource;
+
+    #[test]
+    fn snapshot_and_truncate_rewinds_columns_and_snapshots_future() {
+        use crate::contracts::{BuildMode, ForkConfig};
+        let _guard = crate::session::lock_sessions_env();
+        let dir = std::env::temp_dir().join(format!("ctui-sh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by SESSIONS_ENV_LOCK.
+        unsafe {
+            std::env::set_var("CHOPSTICKS_TUI_SESSIONS_DIR", &dir);
+        }
+
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        app.fork = Some(ForkConfig::Spawn {
+            chain_or_path: "polkadot".into(),
+            build_mode: BuildMode::Manual,
+            mock_signature_host: false,
+        });
+        app.pinned.push(item(1, "row"));
+        for n in 1028..=1045 {
+            app.push_column(column(n, 1, n as u128));
+        }
+        assert_eq!(app.columns.back().unwrap().block.number, 1045);
+
+        let snap = app.snapshot_and_truncate(1030).expect("snapshot ok");
+
+        assert_eq!(app.columns.back().unwrap().block.number, 1030);
+        assert!(app.columns.iter().all(|c| c.block.number <= 1030));
+        assert_eq!(app.off_timeline_from, Some(1030));
+        assert!(app.banner.as_deref().unwrap().contains("timeline-#1045"));
+        assert!(matches!(app.action_log.last(), Some(RecordedAction::SetHead(1030))));
+        assert_eq!(snap, "timeline-#1045");
+        let loaded = session::load_session("timeline-#1045").unwrap();
+        assert_eq!(loaded.head, 1045);
+        assert_eq!(loaded.source, SessionSource::AutoSnapshot);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_head_command_truncates_and_emits_followups() {
+        use crate::contracts::{BuildMode, ForkConfig};
+        let _guard = crate::session::lock_sessions_env();
+        let dir = std::env::temp_dir().join(format!("ctui-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by SESSIONS_ENV_LOCK.
+        unsafe {
+            std::env::set_var("CHOPSTICKS_TUI_SESSIONS_DIR", &dir);
+        }
+
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        app.fork = Some(ForkConfig::Spawn {
+            chain_or_path: "polkadot".into(),
+            build_mode: BuildMode::Manual,
+            mock_signature_host: false,
+        });
+        for n in 1028..=1045 {
+            app.push_column(column(n, 1, n as u128));
+        }
+        let follow = app.on_command_local(Command::SetHead(1030));
+        assert_eq!(app.columns.back().unwrap().block.number, 1030);
+        assert!(follow.iter().any(|c| matches!(c, Command::SetHead(1030))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_session_command_persists_named_session() {
+        let _guard = crate::session::lock_sessions_env();
+        let dir = std::env::temp_dir().join(format!("ctui-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by SESSIONS_ENV_LOCK.
+        unsafe {
+            std::env::set_var("CHOPSTICKS_TUI_SESSIONS_DIR", &dir);
+        }
+
+        let mut app = AppState::new();
+        app.fork = Some(crate::contracts::ForkConfig::Attach { url: "ws://x".into() });
+        app.push_column(column(7, 1, 1));
+        let follow = app.on_command_local(Command::SaveSession("manual-1".into()));
+        assert!(follow.is_empty());
+        let loaded = crate::session::load_session("manual-1").unwrap();
+        assert_eq!(loaded.name, "manual-1");
+        assert_eq!(loaded.head, 7);
+        assert_eq!(loaded.source, SessionSource::Manual);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn begin_restore_refork_and_queues_replay() {
+        use crate::contracts::{BuildMode, ForkConfig};
+        use crate::session::{RecordedAction, Session, SessionSource, TimeSpec};
+        let mut app = AppState::new();
+        let session = Session {
+            name: "repro".into(),
+            fork: ForkConfig::Spawn {
+                chain_or_path: "polkadot".into(),
+                build_mode: BuildMode::Manual,
+                mock_signature_host: false,
+            },
+            pins: vec![item(1, "row")],
+            baseline: Some(1000),
+            actions: vec![
+                RecordedAction::SetHead(1005),
+                RecordedAction::TimeTravel(TimeSpec::from_epoch_ms(1_750_000_000_000, "+1d")),
+            ],
+            head: 1010,
+            source: SessionSource::Manual,
+        };
+        let follow = app.begin_restore(session.clone());
+        assert!(matches!(follow.first(), Some(Command::Connect(_))));
+        assert_eq!(app.pinned.len(), 1);
+        assert_eq!(app.baseline, Some(1000));
+        assert_eq!(app.loaded_session.as_deref(), Some("repro"));
+        assert_eq!(app.replay_queue.len(), 2);
+    }
+
+    #[test]
+    fn drain_replay_queue_emits_commands_in_order() {
+        use crate::session::{RecordedAction, TimeSpec};
+        let mut app = AppState::new();
+        app.replay_queue = std::collections::VecDeque::from(vec![
+            RecordedAction::TimeTravel(TimeSpec::from_epoch_ms(1_750_000_000_000, "+1d")),
+            RecordedAction::SetBuildMode(crate::contracts::BuildMode::Instant),
+            RecordedAction::BuiltBlock { extrinsics: vec![], timestamp: None, author: None },
+        ]);
+        let c1 = app.drain_next_replay();
+        assert!(matches!(c1, Some(Command::TimeTravel(_))));
+        // SetBuildMode is skipped (P3 owns it) → next is the BuiltBlock build.
+        let c2 = app.drain_next_replay();
+        assert!(matches!(c2, Some(Command::BuildBlock)));
+        assert!(app.replay_queue.is_empty());
+        assert!(app.drain_next_replay().is_none());
+    }
+
+    #[test]
+    fn restore_warns_on_base_drift() {
+        let mut app = AppState::new();
+        app.expected_restore_head = Some(1010);
+        app.note_restore_progress(1008);
+        assert!(app.banner.as_deref().unwrap().contains("drift"));
+    }
+
+    #[test]
+    fn dod_set_head_recoverable_and_session_round_trips() {
+        use crate::contracts::{BuildMode, ForkConfig};
+        use crate::session::SessionSource;
+        let _guard = crate::session::lock_sessions_env();
+        let dir = std::env::temp_dir().join(format!("ctui-dod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by SESSIONS_ENV_LOCK.
+        unsafe {
+            std::env::set_var("CHOPSTICKS_TUI_SESSIONS_DIR", &dir);
+        }
+
+        // 1. Connected + a grid with a pin and a baseline.
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        app.fork = Some(ForkConfig::Spawn {
+            chain_or_path: "polkadot".into(),
+            build_mode: BuildMode::Manual,
+            mock_signature_host: false,
+        });
+        app.pinned.push(item(1, "System.Account(Alice).data.free"));
+        app.baseline = Some(1040);
+        for n in 1040..=1045 {
+            app.push_column(column(n, 1, n as u128));
+        }
+
+        // 2. set-head rewind to 1042 → abandoned future recoverable from sessions.
+        let _follow = app.on_command_local(Command::SetHead(1042));
+        assert_eq!(app.columns.back().unwrap().block.number, 1042);
+        assert_eq!(app.off_timeline_from, Some(1042));
+        let recovered = crate::session::load_session("timeline-#1045").unwrap();
+        assert_eq!(recovered.head, 1045);
+        assert_eq!(recovered.source, SessionSource::AutoSnapshot);
+        assert_eq!(recovered.pins.len(), 1);
+
+        // 3. Save the current (rewound) state manually, then restore it.
+        let _ = app.on_command_local(Command::SaveSession("after-rewind".into()));
+        let restore_follow =
+            app.begin_restore(crate::session::load_session("after-rewind").unwrap());
+
+        // Restore re-forks via Connect and reconstructs pins + baseline.
+        assert!(matches!(restore_follow.first(), Some(Command::Connect(_))));
+        assert_eq!(app.pinned.len(), 1);
+        assert_eq!(app.pinned[0].label, "System.Account(Alice).data.free");
+        // The baseline persists faithfully across set-head + save/restore. It was
+        // pinned at #1040 and set-head (which only moves the *head*, not P1's diff
+        // baseline) leaves it untouched, so it round-trips to #1040 — the DoD's
+        // "round-trips to the same state". (The plan draft said 1042, conflating
+        // head with baseline; baseline is P1-owned and head-independent.)
+        assert_eq!(app.baseline, Some(1040));
+        // The recorded set-head is queued for replay (reaches the same pinned state).
+        assert!(app.replay_queue.iter().any(|a| matches!(a, RecordedAction::SetHead(1042))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_appends_to_action_log() {
+        use crate::session::RecordedAction;
+        let mut app = AppState::new();
+        assert!(app.action_log.is_empty());
+        app.record(RecordedAction::SetHead(1030));
+        app.record(RecordedAction::SetBuildMode(crate::contracts::BuildMode::Instant));
+        assert_eq!(app.action_log.len(), 2);
+        assert!(matches!(app.action_log[0], RecordedAction::SetHead(1030)));
+    }
+
+    #[test]
+    fn set_build_mode_updates_state() {
+        use crate::contracts::BuildMode;
+        let mut app = AppState::new();
+        assert_eq!(app.build_mode, BuildMode::Manual); // MVP-1 default
+        app.set_build_mode(BuildMode::Instant);
+        assert_eq!(app.build_mode, BuildMode::Instant);
     }
 
     #[test]
@@ -1228,7 +2084,7 @@ mod tests {
         app.push_column(column(1, 1, 1));
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut term = ratatui::Terminal::new(backend).unwrap();
-        term.draw(|f| render(f, &app, &DefaultRenderer, None, None)).unwrap();
+        term.draw(|f| render(f, &app, &DefaultRenderer, None, None, None, None, None)).unwrap();
         let buf = term.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("NORMAL"), "hint bar mode indicator must render: {dump}");
@@ -1245,7 +2101,21 @@ mod tests {
         app.phase = Phase::Grid;
         let mut picker = None;
         let mut txb = None;
-        handle_key(press_key(KeyCode::Char(':')), &mut app, &tx, &mut picker, &mut txb, None);
+        let mut sse = None;
+        let mut bp = None;
+        let mut sess = None;
+        handle_key(
+            press_key(KeyCode::Char(':')),
+            &mut app,
+            &tx,
+            &mut picker,
+            &mut txb,
+            &mut sse,
+            &mut bp,
+            &mut sess,
+            None,
+            None,
+        );
         assert_eq!(app.mode, Mode::Command);
         assert!(app.palette.is_some());
     }
@@ -1257,8 +2127,33 @@ mod tests {
         app.phase = Phase::Grid;
         let mut picker = None;
         let mut txb = None;
-        handle_key(press_key(KeyCode::Char(':')), &mut app, &tx, &mut picker, &mut txb, None);
-        handle_key(press_key(KeyCode::Esc), &mut app, &tx, &mut picker, &mut txb, None);
+        let mut sse = None;
+        let mut bp = None;
+        let mut sess = None;
+        handle_key(
+            press_key(KeyCode::Char(':')),
+            &mut app,
+            &tx,
+            &mut picker,
+            &mut txb,
+            &mut sse,
+            &mut bp,
+            &mut sess,
+            None,
+            None,
+        );
+        handle_key(
+            press_key(KeyCode::Esc),
+            &mut app,
+            &tx,
+            &mut picker,
+            &mut txb,
+            &mut sse,
+            &mut bp,
+            &mut sess,
+            None,
+            None,
+        );
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.palette.is_none());
     }
@@ -1272,7 +2167,21 @@ mod tests {
         assert_eq!(app.phase, Phase::Connecting);
         let mut picker = None;
         let mut txb = None;
-        handle_key(press_key(KeyCode::Char(':')), &mut app, &tx, &mut picker, &mut txb, None);
+        let mut sse = None;
+        let mut bp = None;
+        let mut sess = None;
+        handle_key(
+            press_key(KeyCode::Char(':')),
+            &mut app,
+            &tx,
+            &mut picker,
+            &mut txb,
+            &mut sse,
+            &mut bp,
+            &mut sess,
+            None,
+            None,
+        );
         assert!(app.palette.is_none(), "palette must not open while connecting");
         assert_eq!(app.mode, Mode::Normal, "mode unchanged while connecting");
     }

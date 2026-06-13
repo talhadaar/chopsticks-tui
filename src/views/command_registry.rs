@@ -2,7 +2,8 @@
 //! verbs the command palette exposes, plus the `:`-line parser that turns a typed
 //! command into either a `Command` to dispatch or a client-side `LocalAction`.
 
-use crate::contracts::{BuildMode, Command, TimeSpec};
+use crate::contracts::{BuildMode, Command};
+use crate::session::{TimeSpec, now_ms};
 
 /// The shape of a single command-line argument. Distinct from
 /// `tx_builder::ArgKind` (which parses call args into `scale_value`); this enum
@@ -152,10 +153,14 @@ pub enum LocalAction {
     SetBaseline(Option<u32>),
     /// Revert to vs-previous diffing.
     ClearBaseline,
-    /// Open the storage picker (`:pin` / `:set-storage` entry point).
+    /// Open the storage picker (`:pin` entry point).
     OpenPicker,
+    /// Open the set-storage editor (`:set-storage` entry point; P2).
+    OpenSetStorage,
     /// Open the transaction builder (`:tx`).
     OpenTxBuilder,
+    /// Open the build staging panel (`:build`). P3 fills the UI.
+    OpenBuildPanel,
     /// Open the sessions modal (`:sessions`). P4 fills the UI.
     OpenSessions,
 }
@@ -223,12 +228,18 @@ pub fn to_route(parsed: &ParsedCommand) -> std::result::Result<CommandRoute, Par
 
     let route = match parsed.spec.name {
         // RPC commands.
-        "set-storage" => CommandRoute::Local(LocalAction::OpenPicker),
+        // `:set-storage` opens the set-storage editor overlay (target picker →
+        // value editor). The editor dispatches `Command::SetStorage` itself once
+        // the user confirms, so this routes to a local overlay-open, not a direct
+        // dispatch (P2).
+        "set-storage" => CommandRoute::Local(LocalAction::OpenSetStorage),
         "set-head" => {
             let n = parse_block("block", arg(0).ok_or(ParseError::MissingArg("block"))?)?;
             CommandRoute::Dispatch(Command::SetHead(n))
         }
-        "build" => CommandRoute::Dispatch(Command::BuildWithQueue(vec![])),
+        // `:build` opens the staging panel (P3); the panel's ↵ emits the actual
+        // `Command::BuildWithQueue`. (Previously a direct empty-queue dispatch.)
+        "build" => CommandRoute::Local(LocalAction::OpenBuildPanel),
         "build-mode" => {
             let raw = arg(0).ok_or(ParseError::MissingArg("mode"))?;
             let mode = match raw.to_ascii_lowercase().as_str() {
@@ -247,9 +258,15 @@ pub fn to_route(parsed: &ParsedCommand) -> std::result::Result<CommandRoute, Par
         }
         "time-travel" => {
             let raw = arg(0).ok_or(ParseError::MissingArg("when"))?;
-            // P4 owns the real parser; P0 routes the raw string as a relative spec
-            // so dispatch (a stub here) compiles. P4 replaces this branch.
-            CommandRoute::Dispatch(Command::TimeTravel(TimeSpec::Relative(raw.to_string())))
+            // P4 parses the spec to an absolute instant here so the palette can
+            // surface a `BadArg` error before dispatch. Relative offsets resolve
+            // against the wall clock at parse time.
+            let spec = TimeSpec::parse(raw, now_ms()).map_err(|e| ParseError::BadArg {
+                name: "when",
+                value: raw.to_string(),
+                reason: e.to_string(),
+            })?;
+            CommandRoute::Dispatch(Command::TimeTravel(spec))
         }
         // Local actions.
         "set-baseline" => {
@@ -363,6 +380,15 @@ mod tests {
             CommandRoute::Local(LocalAction::SetBaseline(None)) => {}
             other => panic!("expected SetBaseline(None), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn route_set_storage_opens_editor_overlay() {
+        let p = parse_line("set-storage").unwrap();
+        assert!(matches!(
+            to_route(&p).unwrap(),
+            CommandRoute::Local(LocalAction::OpenSetStorage)
+        ));
     }
 
     #[test]

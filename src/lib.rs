@@ -10,6 +10,7 @@ pub mod chain;
 pub mod chopsticks;
 pub mod contracts;
 pub mod render;
+pub mod session;
 pub mod views;
 
 #[cfg(test)]
