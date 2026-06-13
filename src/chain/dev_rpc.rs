@@ -27,7 +27,9 @@
 
 use subxt::tx::{Payload, Signer};
 use subxt::utils::{AccountId32, H256, MultiSignature};
-use subxt::{OnlineClient, PolkadotConfig, rpcs::RpcClient, rpcs::client::rpc_params};
+use subxt::{
+    OnlineClient, PolkadotConfig, rpcs::RpcClient, rpcs::client::RpcParams, rpcs::client::rpc_params,
+};
 use subxt_signer::sr25519::{Keypair, dev};
 
 use crate::contracts::{BlockRef, DevAccount, EventSummary, PreparedTx, Result, TxOutcome, TxSigner};
@@ -44,6 +46,42 @@ pub(crate) async fn new_block(rpc: &RpcClient) -> Result<BlockRef> {
     let number = parse_header_number(&header)?;
 
     Ok(BlockRef { number, hash })
+}
+
+/// Build the positional params for `dev_setStorage`. Chopsticks takes a single
+/// argument: the edits. We use the *raw* form — a JSON array of
+/// `[storageKeyHex, valueHex]` pairs (a `null` value deletes the key). Split out
+/// as a pure fn so the param shape is unit-testable without a live node.
+fn set_storage_params(edits: &serde_json::Value) -> Vec<serde_json::Value> {
+    vec![edits.clone()]
+}
+
+/// Adapt a runtime `Vec<serde_json::Value>` into subxt's `RpcParams`. (`rpc_params!`
+/// only handles compile-time literal lists.)
+fn rpc_params_from(values: Vec<serde_json::Value>) -> RpcParams {
+    let mut params = RpcParams::new();
+    for v in values {
+        // `push` serializes the value; a `serde_json::Value` always serializes.
+        params.push(v).expect("serde_json::Value always serializes");
+    }
+    params
+}
+
+/// Write raw storage at head via `dev_setStorage` (no new block is produced).
+///
+/// `edits` is the raw form: `[[keyHex, valueHex], …]`. The caller
+/// (`views/set_storage.rs`) encodes the key + value to hex, so this is a thin
+/// passthrough. The new-head hash Chopsticks returns is discarded — the write is
+/// in-place at the current head and the UI refetches pinned items separately.
+///
+/// Live-only: exercised by the `#[ignore]`d integration test, not the offline
+/// unit suite (matches this module's existing test policy).
+pub(crate) async fn set_storage(rpc: &RpcClient, edits: serde_json::Value) -> Result<()> {
+    let params = set_storage_params(&edits);
+    // `dev_setStorage` returns the resulting block hash (hex string); we only
+    // care that the call succeeds.
+    let _hash: String = rpc.request("dev_setStorage", rpc_params_from(params)).await?;
+    Ok(())
 }
 
 /// Submit a prepared extrinsic and resolve once it is included, decoding the
@@ -167,7 +205,7 @@ fn parse_block_hash(s: &str) -> Result<H256> {
 }
 
 /// Parse the `number` field of an RPC block header (a hex string) into a `u32`.
-fn parse_header_number(header: &serde_json::Value) -> Result<u32> {
+pub(crate) fn parse_header_number(header: &serde_json::Value) -> Result<u32> {
     let raw = header
         .get("number")
         .and_then(|n| n.as_str())
@@ -201,6 +239,14 @@ fn from_hex(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_storage_params_wraps_edits_as_single_arg() {
+        let edits = serde_json::json!([["0x26aa", "0x0100"]]);
+        let params = set_storage_params(&edits);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], edits);
+    }
 
     #[test]
     fn parse_header_number_decodes_hex() {
