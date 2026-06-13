@@ -379,6 +379,15 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 pub static SESSIONS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Acquire [`SESSIONS_ENV_LOCK`], tolerating poisoning so one failing test does
+/// not cascade `PoisonError`s into every other env-dependent test.
+#[cfg(test)]
+pub fn lock_sessions_env() -> std::sync::MutexGuard<'static, ()> {
+    SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,7 +514,7 @@ mod tests {
     #[test]
     fn session_round_trips_through_disk() {
         use crate::contracts::{BuildMode, ForkConfig, KeyArg, PinnedItem, PinnedItemId};
-        let _guard = SESSIONS_ENV_LOCK.lock().unwrap();
+        let _guard = lock_sessions_env();
         let dir = std::env::temp_dir().join(format!("ctui-sess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: serialized by SESSIONS_ENV_LOCK; we set the override for this process.

@@ -1831,7 +1831,7 @@ mod tests {
     #[test]
     fn snapshot_and_truncate_rewinds_columns_and_snapshots_future() {
         use crate::contracts::{BuildMode, ForkConfig};
-        let _guard = crate::session::SESSIONS_ENV_LOCK.lock().unwrap();
+        let _guard = crate::session::lock_sessions_env();
         let dir = std::env::temp_dir().join(format!("ctui-sh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: serialized by SESSIONS_ENV_LOCK.
@@ -1870,7 +1870,7 @@ mod tests {
     #[test]
     fn set_head_command_truncates_and_emits_followups() {
         use crate::contracts::{BuildMode, ForkConfig};
-        let _guard = crate::session::SESSIONS_ENV_LOCK.lock().unwrap();
+        let _guard = crate::session::lock_sessions_env();
         let dir = std::env::temp_dir().join(format!("ctui-cmd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: serialized by SESSIONS_ENV_LOCK.
@@ -1897,7 +1897,7 @@ mod tests {
 
     #[test]
     fn save_session_command_persists_named_session() {
-        let _guard = crate::session::SESSIONS_ENV_LOCK.lock().unwrap();
+        let _guard = crate::session::lock_sessions_env();
         let dir = std::env::temp_dir().join(format!("ctui-save-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: serialized by SESSIONS_ENV_LOCK.
@@ -1971,6 +1971,62 @@ mod tests {
         app.expected_restore_head = Some(1010);
         app.note_restore_progress(1008);
         assert!(app.banner.as_deref().unwrap().contains("drift"));
+    }
+
+    #[test]
+    fn dod_set_head_recoverable_and_session_round_trips() {
+        use crate::contracts::{BuildMode, ForkConfig};
+        use crate::session::SessionSource;
+        let _guard = crate::session::lock_sessions_env();
+        let dir = std::env::temp_dir().join(format!("ctui-dod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by SESSIONS_ENV_LOCK.
+        unsafe {
+            std::env::set_var("CHOPSTICKS_TUI_SESSIONS_DIR", &dir);
+        }
+
+        // 1. Connected + a grid with a pin and a baseline.
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        app.fork = Some(ForkConfig::Spawn {
+            chain_or_path: "polkadot".into(),
+            build_mode: BuildMode::Manual,
+            mock_signature_host: false,
+        });
+        app.pinned.push(item(1, "System.Account(Alice).data.free"));
+        app.baseline = Some(1040);
+        for n in 1040..=1045 {
+            app.push_column(column(n, 1, n as u128));
+        }
+
+        // 2. set-head rewind to 1042 → abandoned future recoverable from sessions.
+        let _follow = app.on_command_local(Command::SetHead(1042));
+        assert_eq!(app.columns.back().unwrap().block.number, 1042);
+        assert_eq!(app.off_timeline_from, Some(1042));
+        let recovered = crate::session::load_session("timeline-#1045").unwrap();
+        assert_eq!(recovered.head, 1045);
+        assert_eq!(recovered.source, SessionSource::AutoSnapshot);
+        assert_eq!(recovered.pins.len(), 1);
+
+        // 3. Save the current (rewound) state manually, then restore it.
+        let _ = app.on_command_local(Command::SaveSession("after-rewind".into()));
+        let restore_follow =
+            app.begin_restore(crate::session::load_session("after-rewind").unwrap());
+
+        // Restore re-forks via Connect and reconstructs pins + baseline.
+        assert!(matches!(restore_follow.first(), Some(Command::Connect(_))));
+        assert_eq!(app.pinned.len(), 1);
+        assert_eq!(app.pinned[0].label, "System.Account(Alice).data.free");
+        // The baseline persists faithfully across set-head + save/restore. It was
+        // pinned at #1040 and set-head (which only moves the *head*, not P1's diff
+        // baseline) leaves it untouched, so it round-trips to #1040 — the DoD's
+        // "round-trips to the same state". (The plan draft said 1042, conflating
+        // head with baseline; baseline is P1-owned and head-independent.)
+        assert_eq!(app.baseline, Some(1040));
+        // The recorded set-head is queued for replay (reaches the same pinned state).
+        assert!(app.replay_queue.iter().any(|a| matches!(a, RecordedAction::SetHead(1042))));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
