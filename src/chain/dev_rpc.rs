@@ -321,4 +321,117 @@ mod tests {
         let _ = payload;
         assert_eq!(tx.call, "transfer_keep_alive");
     }
+
+    /// Live integration test: write `Balances.TotalIssuance` via `dev_setStorage`
+    /// (raw form) and confirm a refetch reflects the new value. Ignored by
+    /// default; run with `cargo test -- --ignored set_storage`. Requires `npx`
+    /// network access (sandbox OFF).
+    #[tokio::test]
+    #[ignore = "live: spawns chopsticks on :8003, needs network"]
+    async fn live_set_storage_round_trip() {
+        use crate::chain::storage_fetch::{fetch, storage_key_hex};
+        use crate::chain::storage_catalog::MetadataCatalog;
+        use crate::contracts::{CellState, PinnedItem, PinnedItemId, StorageCatalog};
+        use crate::views::set_storage::encode_scale_text;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let mut child = Command::new("npx")
+            .args([
+                "--yes",
+                "@acala-network/chopsticks@1.4.2",
+                "-c",
+                "polkadot",
+                "--build-block-mode",
+                "Manual",
+                "--port",
+                "8003",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn chopsticks");
+        let pgid = child.id() as i32;
+
+        let result = async {
+            let url = "ws://localhost:8003";
+            let inner = {
+                let mut last_err = None;
+                let mut connected = None;
+                for _ in 0..60 {
+                    match OnlineClient::<PolkadotConfig>::from_url(url).await {
+                        Ok(c) => {
+                            connected = Some(c);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+                connected.unwrap_or_else(|| panic!("chopsticks never came up: {last_err:?}"))
+            };
+            let rpc = RpcClient::from_url(url).await.expect("rpc client");
+
+            let at = inner.at_current_block().await.expect("at_current_block");
+            let block_hash = at.block_hash();
+            let metadata = at.metadata();
+
+            // Target a plain numeric entry: Balances.TotalIssuance (u128).
+            let item = PinnedItem {
+                id: PinnedItemId(1),
+                pallet: "Balances".to_string(),
+                entry: "TotalIssuance".to_string(),
+                keys: vec![],
+                path: vec![],
+                label: "Balances.TotalIssuance".to_string(),
+            };
+
+            // Read the current value (structural read only).
+            let before = fetch(&inner, &item, block_hash).await.expect("fetch before");
+            assert!(
+                matches!(before, CellState::Value(_)),
+                "TotalIssuance should decode, got {before:?}"
+            );
+
+            // Encode the storage key offline + a brand-new value distinct from the
+            // current issuance (1 DOT = 10 decimals; pick an obviously different
+            // round number).
+            let key_hex = storage_key_hex(&metadata, &item).expect("derive key");
+            let catalog = MetadataCatalog { metadata: &metadata };
+            let value_type_id = catalog
+                .entry("Balances", "TotalIssuance")
+                .expect("entry")
+                .value_type_id;
+            let value_hex = encode_scale_text("123456789000", value_type_id, metadata.types())
+                .expect("encode value");
+
+            // Write via the raw form and refetch at head.
+            let edits = serde_json::json!([[key_hex, value_hex]]);
+            set_storage(&rpc, edits).await.expect("set_storage");
+
+            let at2 = inner.at_current_block().await.expect("at_current_block 2");
+            let after = fetch(&inner, &item, at2.block_hash()).await.expect("fetch after");
+            match after {
+                CellState::Value(v) => {
+                    // The new value must differ from the original (structural check).
+                    let before_str = format!("{before:?}");
+                    let after_str = format!("{:?}", CellState::Value(v));
+                    assert_ne!(before_str, after_str, "value must change after set_storage");
+                }
+                other => panic!("expected Value after set, got {other:?}"),
+            }
+        }
+        .await;
+
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{pgid}")])
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+        result
+    }
 }
