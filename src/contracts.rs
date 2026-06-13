@@ -227,14 +227,26 @@ pub enum DevAccount {
     Ferdie,
 }
 
-/// A request to write a storage value at the tip (`dev_setStorage`). Payload is
-/// refined by P2; P0 declares the minimal shape the registry/dispatch reference.
-#[derive(Debug, Clone)]
+/// A fully-prepared `dev_setStorage` write (payload refined by P2 from P0's stub).
+///
+/// The set-storage editor encodes the storage key and the new value to hex up
+/// front, so the RPC helper is a thin passthrough and this payload is
+/// `serde`-serializable for session replay (P4).
+///
+/// `key_hex` is the *hashed* storage key (what `StorageEntry::fetch_key`
+/// produces); `value_hex` is the SCALE-encoded new value. Both are
+/// `0x`-prefixed. A `None` `value_hex` deletes the key (Chopsticks treats a
+/// `null` value as a removal) — not surfaced in the MVP-2 UI yet but modelled
+/// so the type is complete.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SetStorageReq {
-    pub pallet: String,
-    pub entry: String,
-    /// The new value as scale-value JSON (P2 decides the exact encoding).
-    pub value_json: serde_json::Value,
+    /// `0x`-prefixed hashed storage key.
+    pub key_hex: String,
+    /// `0x`-prefixed SCALE-encoded value, or `None` to delete the key.
+    pub value_hex: Option<String>,
+    /// Human label for banners / the action log, e.g.
+    /// `System.Account(Alice).data.free = 1000 DOT`.
+    pub label: String,
 }
 
 /// How a `time-travel` target is specified. Parser + remaining variants owned by
@@ -335,9 +347,9 @@ mod tests {
         // Constructing each variant proves the shape compiles and is `Clone`.
         let cmds = vec![
             Command::SetStorage(SetStorageReq {
-                pallet: "System".into(),
-                entry: "Account".into(),
-                value_json: serde_json::Value::Null,
+                key_hex: "0x26aa".into(),
+                value_hex: Some("0x0100".into()),
+                label: "System.Account = …".into(),
             }),
             Command::SetHead(1030),
             Command::TimeTravel(TimeSpec::Relative("+6s".into())),
@@ -348,5 +360,17 @@ mod tests {
         ];
         let _again = cmds.clone();
         assert_eq!(cmds.len(), 7);
+    }
+
+    #[test]
+    fn set_storage_req_round_trips_through_json() {
+        let req = SetStorageReq {
+            key_hex: "0x26aa".to_string(),
+            value_hex: Some("0x0100".to_string()),
+            label: "System.Account(Alice).data.free = 1 DOT".to_string(),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: SetStorageReq = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, req);
     }
 }

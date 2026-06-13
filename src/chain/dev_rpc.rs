@@ -27,7 +27,9 @@
 
 use subxt::tx::{Payload, Signer};
 use subxt::utils::{AccountId32, H256, MultiSignature};
-use subxt::{OnlineClient, PolkadotConfig, rpcs::RpcClient, rpcs::client::rpc_params};
+use subxt::{
+    OnlineClient, PolkadotConfig, rpcs::RpcClient, rpcs::client::RpcParams, rpcs::client::rpc_params,
+};
 use subxt_signer::sr25519::{Keypair, dev};
 
 use crate::contracts::{BlockRef, DevAccount, EventSummary, PreparedTx, Result, TxOutcome, TxSigner};
@@ -44,6 +46,42 @@ pub(crate) async fn new_block(rpc: &RpcClient) -> Result<BlockRef> {
     let number = parse_header_number(&header)?;
 
     Ok(BlockRef { number, hash })
+}
+
+/// Build the positional params for `dev_setStorage`. Chopsticks takes a single
+/// argument: the edits. We use the *raw* form — a JSON array of
+/// `[storageKeyHex, valueHex]` pairs (a `null` value deletes the key). Split out
+/// as a pure fn so the param shape is unit-testable without a live node.
+fn set_storage_params(edits: &serde_json::Value) -> Vec<serde_json::Value> {
+    vec![edits.clone()]
+}
+
+/// Adapt a runtime `Vec<serde_json::Value>` into subxt's `RpcParams`. (`rpc_params!`
+/// only handles compile-time literal lists.)
+fn rpc_params_from(values: Vec<serde_json::Value>) -> RpcParams {
+    let mut params = RpcParams::new();
+    for v in values {
+        // `push` serializes the value; a `serde_json::Value` always serializes.
+        params.push(v).expect("serde_json::Value always serializes");
+    }
+    params
+}
+
+/// Write raw storage at head via `dev_setStorage` (no new block is produced).
+///
+/// `edits` is the raw form: `[[keyHex, valueHex], …]`. The caller
+/// (`views/set_storage.rs`) encodes the key + value to hex, so this is a thin
+/// passthrough. The new-head hash Chopsticks returns is discarded — the write is
+/// in-place at the current head and the UI refetches pinned items separately.
+///
+/// Live-only: exercised by the `#[ignore]`d integration test, not the offline
+/// unit suite (matches this module's existing test policy).
+pub(crate) async fn set_storage(rpc: &RpcClient, edits: serde_json::Value) -> Result<()> {
+    let params = set_storage_params(&edits);
+    // `dev_setStorage` returns the resulting block hash (hex string); we only
+    // care that the call succeeds.
+    let _hash: String = rpc.request("dev_setStorage", rpc_params_from(params)).await?;
+    Ok(())
 }
 
 /// Submit a prepared extrinsic and resolve once it is included, decoding the
@@ -167,7 +205,7 @@ fn parse_block_hash(s: &str) -> Result<H256> {
 }
 
 /// Parse the `number` field of an RPC block header (a hex string) into a `u32`.
-fn parse_header_number(header: &serde_json::Value) -> Result<u32> {
+pub(crate) fn parse_header_number(header: &serde_json::Value) -> Result<u32> {
     let raw = header
         .get("number")
         .and_then(|n| n.as_str())
@@ -201,6 +239,14 @@ fn from_hex(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_storage_params_wraps_edits_as_single_arg() {
+        let edits = serde_json::json!([["0x26aa", "0x0100"]]);
+        let params = set_storage_params(&edits);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], edits);
+    }
 
     #[test]
     fn parse_header_number_decodes_hex() {
@@ -274,5 +320,118 @@ mod tests {
         // Constructing the dynamic payload must not panic; presence is enough.
         let _ = payload;
         assert_eq!(tx.call, "transfer_keep_alive");
+    }
+
+    /// Live integration test: write `Balances.TotalIssuance` via `dev_setStorage`
+    /// (raw form) and confirm a refetch reflects the new value. Ignored by
+    /// default; run with `cargo test -- --ignored set_storage`. Requires `npx`
+    /// network access (sandbox OFF).
+    #[tokio::test]
+    #[ignore = "live: spawns chopsticks on :8003, needs network"]
+    async fn live_set_storage_round_trip() {
+        use crate::chain::storage_fetch::{fetch, storage_key_hex};
+        use crate::chain::storage_catalog::MetadataCatalog;
+        use crate::contracts::{CellState, PinnedItem, PinnedItemId, StorageCatalog};
+        use crate::views::set_storage::encode_scale_text;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let mut child = Command::new("npx")
+            .args([
+                "--yes",
+                "@acala-network/chopsticks@1.4.2",
+                "-c",
+                "polkadot",
+                "--build-block-mode",
+                "Manual",
+                "--port",
+                "8003",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn chopsticks");
+        let pgid = child.id() as i32;
+
+        let result = async {
+            let url = "ws://localhost:8003";
+            let inner = {
+                let mut last_err = None;
+                let mut connected = None;
+                for _ in 0..60 {
+                    match OnlineClient::<PolkadotConfig>::from_url(url).await {
+                        Ok(c) => {
+                            connected = Some(c);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+                connected.unwrap_or_else(|| panic!("chopsticks never came up: {last_err:?}"))
+            };
+            let rpc = RpcClient::from_url(url).await.expect("rpc client");
+
+            let at = inner.at_current_block().await.expect("at_current_block");
+            let block_hash = at.block_hash();
+            let metadata = at.metadata();
+
+            // Target a plain numeric entry: Balances.TotalIssuance (u128).
+            let item = PinnedItem {
+                id: PinnedItemId(1),
+                pallet: "Balances".to_string(),
+                entry: "TotalIssuance".to_string(),
+                keys: vec![],
+                path: vec![],
+                label: "Balances.TotalIssuance".to_string(),
+            };
+
+            // Read the current value (structural read only).
+            let before = fetch(&inner, &item, block_hash).await.expect("fetch before");
+            assert!(
+                matches!(before, CellState::Value(_)),
+                "TotalIssuance should decode, got {before:?}"
+            );
+
+            // Encode the storage key offline + a brand-new value distinct from the
+            // current issuance (1 DOT = 10 decimals; pick an obviously different
+            // round number).
+            let key_hex = storage_key_hex(&metadata, &item).expect("derive key");
+            let catalog = MetadataCatalog { metadata: &metadata };
+            let value_type_id = catalog
+                .entry("Balances", "TotalIssuance")
+                .expect("entry")
+                .value_type_id;
+            let value_hex = encode_scale_text("123456789000", value_type_id, metadata.types())
+                .expect("encode value");
+
+            // Write via the raw form and refetch at head.
+            let edits = serde_json::json!([[key_hex, value_hex]]);
+            set_storage(&rpc, edits).await.expect("set_storage");
+
+            let at2 = inner.at_current_block().await.expect("at_current_block 2");
+            let after = fetch(&inner, &item, at2.block_hash()).await.expect("fetch after");
+            match after {
+                CellState::Value(v) => {
+                    // The new value must differ from the original (structural check).
+                    let before_str = format!("{before:?}");
+                    let after_str = format!("{:?}", CellState::Value(v));
+                    assert_ne!(before_str, after_str, "value must change after set_storage");
+                }
+                other => panic!("expected Value after set, got {other:?}"),
+            }
+        }
+        .await;
+
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{pgid}")])
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+        result
     }
 }

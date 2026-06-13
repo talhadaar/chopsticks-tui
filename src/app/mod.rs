@@ -34,6 +34,7 @@ use crate::render::value::DefaultRenderer;
 use crate::views::connection::ConnectionView;
 use crate::views::grid::{GridCell, GridRow, GridView, GridViewModel};
 use crate::views::picker::StoragePicker;
+use crate::views::set_storage::{SetStorageEditor, ValueMode};
 use crate::views::tx_builder::{ArgKind, ArgSpec, CallCatalog, TxBuilder};
 use crate::app::input::{KeyRouting, Mode, route_key};
 use crate::views::command_registry::{CommandRoute, LocalAction, parse_line, to_route};
@@ -240,7 +241,9 @@ impl AppState {
                 self.banner = Some("not yet implemented".into());
             }
             // Overlay/modal opens are performed by the loop, not by state.
-            LocalAction::OpenPicker | LocalAction::OpenTxBuilder => {}
+            LocalAction::OpenPicker
+            | LocalAction::OpenTxBuilder
+            | LocalAction::OpenSetStorage => {}
         }
     }
 
@@ -507,9 +510,19 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
     let mut catalog: Option<&'static MetadataCatalog<'static>> = None;
     let mut picker: Option<StoragePicker<'static>> = None;
     let mut tx_builder: Option<TxBuilder<CuratedCallCatalog>> = None;
+    let mut set_storage_editor: Option<SetStorageEditor<'static>> = None;
 
     loop {
-        terminal.draw(|f| render(f, &app, &renderer, picker.as_ref(), tx_builder.as_ref()))?;
+        terminal.draw(|f| {
+            render(
+                f,
+                &app,
+                &renderer,
+                picker.as_ref(),
+                tx_builder.as_ref(),
+                set_storage_editor.as_ref(),
+            )
+        })?;
         if app.should_quit {
             break;
         }
@@ -517,7 +530,16 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
         tokio::select! {
             Some(ct) = key_rx.recv() => {
                 if let CtEvent::Key(key) = ct && key.kind == KeyEventKind::Press {
-                    handle_key(key, &mut app, &cmd_tx, &mut picker, &mut tx_builder, catalog);
+                    handle_key(
+                        key,
+                        &mut app,
+                        &cmd_tx,
+                        &mut picker,
+                        &mut tx_builder,
+                        &mut set_storage_editor,
+                        client,
+                        catalog,
+                    );
                 }
             }
             Some(ev) = evt_rx.recv() => {
@@ -554,7 +576,7 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
-                dispatch(cmd, client, &evt_tx, &client_tx);
+                dispatch(cmd, client, &evt_tx, &client_tx, app.pinned.clone());
             }
         }
     }
@@ -562,18 +584,37 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
 }
 
 /// Route a key to the connection screen, an open overlay, or the grid.
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     key: KeyEvent,
     app: &mut AppState,
     cmd_tx: &mpsc::UnboundedSender<Command>,
     picker: &mut Option<StoragePicker<'static>>,
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+    set_storage_editor: &mut Option<SetStorageEditor<'static>>,
+    client: Option<&'static SubxtChainClient>,
     catalog: Option<&'static MetadataCatalog<'static>>,
 ) {
     // Connecting: drive the connection form (unchanged MVP-1 behavior).
     if app.phase == Phase::Connecting {
         if let Some(cmd) = app.connection.on_key(key) {
             let _ = cmd_tx.send(cmd);
+        }
+        return;
+    }
+
+    // Set-storage editor open: route to it ahead of grid/palette. Esc closes;
+    // a confirmed value dispatches `Command::SetStorage`.
+    if let Some(ed) = set_storage_editor.as_mut() {
+        if key.code == KeyCode::Esc {
+            *set_storage_editor = None;
+            app.mode = Mode::Normal;
+            return;
+        }
+        if let Some(cmd) = ed.on_key(key) {
+            let _ = cmd_tx.send(cmd);
+            *set_storage_editor = None;
+            app.mode = Mode::Normal;
         }
         return;
     }
@@ -599,7 +640,16 @@ fn handle_key(
             }
         }
         KeyRouting::Palette(key) => {
-            handle_palette_key(key, app, cmd_tx, picker, tx_builder, catalog);
+            handle_palette_key(
+                key,
+                app,
+                cmd_tx,
+                picker,
+                tx_builder,
+                set_storage_editor,
+                client,
+                catalog,
+            );
         }
         KeyRouting::Overlay(key) => {
             handle_overlay_key(key, app, cmd_tx, picker, tx_builder);
@@ -609,12 +659,15 @@ fn handle_key(
 
 /// Feed a key to the open palette and act on its outcome. Owns the Command→Normal
 /// transition and the parse/route → dispatch-or-local plumbing.
+#[allow(clippy::too_many_arguments)]
 fn handle_palette_key(
     key: KeyEvent,
     app: &mut AppState,
     cmd_tx: &mpsc::UnboundedSender<Command>,
     picker: &mut Option<StoragePicker<'static>>,
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+    set_storage_editor: &mut Option<SetStorageEditor<'static>>,
+    client: Option<&'static SubxtChainClient>,
     catalog: Option<&'static MetadataCatalog<'static>>,
 ) {
     let outcome = match app.palette.as_mut() {
@@ -650,6 +703,14 @@ fn handle_palette_key(
                         LocalAction::OpenTxBuilder => {
                             *tx_builder = Some(TxBuilder::new(CuratedCallCatalog));
                             app.mode = Mode::Insert;
+                        }
+                        LocalAction::OpenSetStorage => {
+                            if let (Some(c), Some(cat)) = (client, catalog) {
+                                *set_storage_editor = Some(build_set_storage_editor(c, cat));
+                                app.mode = Mode::Insert;
+                            } else {
+                                app.banner = Some("set-storage: not connected".into());
+                            }
                         }
                         other => app.apply_local(other),
                     }
@@ -707,6 +768,7 @@ fn dispatch(
     client: Option<&'static SubxtChainClient>,
     evt_tx: &mpsc::UnboundedSender<Event>,
     client_tx: &mpsc::UnboundedSender<&'static SubxtChainClient>,
+    pinned: Vec<PinnedItem>,
 ) {
     match cmd {
         Command::Connect(cfg) => spawn_connect(cfg, evt_tx.clone(), client_tx.clone()),
@@ -746,9 +808,37 @@ fn dispatch(
         // pinned set on each block, so nothing to spawn here.
         Command::Pin(_) | Command::Unpin(_) => {}
         Command::Quit => {}
+        // P2: write raw storage at head (no new block), then refetch pinned items
+        // at the current head so the change lands yellow on the tip column.
+        Command::SetStorage(req) => {
+            if let Some(c) = client {
+                let rpc = c.rpc().clone();
+                let evt = evt_tx.clone();
+                tokio::spawn(async move {
+                    // Build the raw edits array `[[keyHex, valueHex]]` (a null value
+                    // would delete the key; the editor never sends that yet).
+                    let value_json = match &req.value_hex {
+                        Some(v) => serde_json::Value::String(v.clone()),
+                        None => serde_json::Value::Null,
+                    };
+                    let edits = serde_json::json!([[req.key_hex, value_json]]);
+                    if let Err(e) = dev_rpc::set_storage(&rpc, edits).await {
+                        let _ = evt.send(Event::Error(format!("set storage: {e}")));
+                        return;
+                    }
+                    match head_block_ref(c).await {
+                        Ok(head) => refetch_at_head(c, head, pinned, evt.clone()).await,
+                        Err(e) => {
+                            let _ = evt.send(Event::Error(format!("set storage refetch: {e}")));
+                        }
+                    }
+                });
+            } else {
+                let _ = evt_tx.send(Event::Error("set storage: not connected".into()));
+            }
+        }
         // MVP-2 commands: P0 lands stub arms; owning plans replace them.
-        Command::SetStorage(_)
-        | Command::SetHead(_)
+        Command::SetHead(_)
         | Command::TimeTravel(_)
         | Command::SetBuildMode(_)
         | Command::BuildWithQueue(_)
@@ -807,6 +897,88 @@ fn spawn_connect(
     });
 }
 
+/// Resolve the current head as a `BlockRef` (number + hash) by pinning the
+/// current block (as `blocks::poll_head` does). After an in-place
+/// `dev_setStorage` the head number is unchanged, so the refetched column lands
+/// on the tip and diffs yellow vs the previous column (P2).
+async fn head_block_ref(
+    client: &'static SubxtChainClient,
+) -> Result<crate::contracts::BlockRef> {
+    let at = client.inner().at_current_block().await?;
+    Ok(crate::contracts::BlockRef {
+        number: at.block_number() as u32,
+        hash: at.block_hash(),
+    })
+}
+
+/// Fetch every pinned item at `head` and emit the column (same body as
+/// `spawn_fetch_column`, awaited inline so the write→refetch is sequential).
+async fn refetch_at_head(
+    client: &'static SubxtChainClient,
+    head: crate::contracts::BlockRef,
+    pinned: Vec<PinnedItem>,
+    evt_tx: mpsc::UnboundedSender<Event>,
+) {
+    let inner = client.inner().clone();
+    let mut cells = std::collections::BTreeMap::new();
+    for item in &pinned {
+        let state = storage_fetch::fetch(&inner, item, head.hash)
+            .await
+            .unwrap_or_else(|e| CellState::Undecodable {
+                raw_hex: String::new(),
+                error: e.to_string(),
+            });
+        cells.insert(item.id, state);
+    }
+    let _ = evt_tx.send(Event::NewColumn(BlockColumn { block: head, cells }));
+}
+
+/// Build a [`SetStorageEditor`] wired to the live client + metadata catalog (P2).
+///
+/// * key resolver: derives the hashed storage key offline from metadata
+///   (`storage_fetch::storage_key_hex`) and resolves the entry's value type-id
+///   (`storage_fetch::entry_value_type_id`) — both sync, no network round-trip.
+/// * text encoder: scale-value text / raw hex → `value_hex`, encoding against the
+///   resolved value type-id using the live metadata registry.
+/// * tree encoder: re-encodes the edited typed-tree value against the type-id.
+fn build_set_storage_editor(
+    client: &'static SubxtChainClient,
+    catalog: &'static MetadataCatalog<'static>,
+) -> SetStorageEditor<'static> {
+    use crate::views::set_storage::{encode_raw_hex, encode_scale_text, encode_value};
+
+    let metadata = client.metadata();
+
+    // Key resolver: offline storage-key derivation + value type-id lookup.
+    let resolve_key = move |item: &PinnedItem| -> std::result::Result<(String, u32), String> {
+        let key_hex = storage_fetch::storage_key_hex(metadata, item).map_err(|e| e.to_string())?;
+        let type_id = storage_fetch::entry_value_type_id(metadata, &item.pallet, &item.entry)
+            .map_err(|e| e.to_string())?;
+        Ok((key_hex, type_id))
+    };
+
+    // Text encoder: raw hex needs nothing; scale-value text encodes against the
+    // entry's value type-id using the live metadata registry.
+    let encode_text = move |mode, raw: &str, type_id: u32| -> std::result::Result<String, String> {
+        match mode {
+            ValueMode::RawHex => encode_raw_hex(raw),
+            ValueMode::ScaleText => encode_scale_text(raw, type_id, metadata.types()),
+            ValueMode::Tree => Err("tree mode encodes via Enter, not text".to_string()),
+        }
+    };
+
+    // Tree encoder: re-encode the whole edited decoded value against the type-id.
+    let encode_tree = move |value: &scale_value::Value<u32>,
+                            type_id: u32|
+          -> std::result::Result<String, String> {
+        encode_value(value, type_id, metadata.types())
+    };
+
+    SetStorageEditor::new(catalog, resolve_key)
+        .with_encoder(encode_text)
+        .with_tree_encoder(encode_tree)
+}
+
 /// Fetch every pinned item at `blk` and emit the resulting `BlockColumn`.
 fn spawn_fetch_column(
     client: &'static SubxtChainClient,
@@ -840,6 +1012,7 @@ fn render(
     renderer: &dyn crate::contracts::ValueRenderer,
     picker: Option<&StoragePicker<'static>>,
     tx_builder: Option<&TxBuilder<CuratedCallCatalog>>,
+    set_storage_editor: Option<&SetStorageEditor<'static>>,
 ) {
     let area = f.area();
     match app.phase {
@@ -886,7 +1059,11 @@ fn render(
             render_hint_bar(f, chunks[3], app.mode);
 
             // Overlays draw on top in a centered area; the palette anchors itself.
-            if let Some(p) = picker {
+            if let Some(ed) = set_storage_editor {
+                let a = centered(area, 70, 70);
+                f.render_widget(Clear, a);
+                ed.render(f, a);
+            } else if let Some(p) = picker {
                 let a = centered(area, 70, 70);
                 f.render_widget(Clear, a);
                 p.render(f, a);
@@ -1228,7 +1405,7 @@ mod tests {
         app.push_column(column(1, 1, 1));
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut term = ratatui::Terminal::new(backend).unwrap();
-        term.draw(|f| render(f, &app, &DefaultRenderer, None, None)).unwrap();
+        term.draw(|f| render(f, &app, &DefaultRenderer, None, None, None)).unwrap();
         let buf = term.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("NORMAL"), "hint bar mode indicator must render: {dump}");
@@ -1245,7 +1422,17 @@ mod tests {
         app.phase = Phase::Grid;
         let mut picker = None;
         let mut txb = None;
-        handle_key(press_key(KeyCode::Char(':')), &mut app, &tx, &mut picker, &mut txb, None);
+        let mut sse = None;
+        handle_key(
+            press_key(KeyCode::Char(':')),
+            &mut app,
+            &tx,
+            &mut picker,
+            &mut txb,
+            &mut sse,
+            None,
+            None,
+        );
         assert_eq!(app.mode, Mode::Command);
         assert!(app.palette.is_some());
     }
@@ -1257,8 +1444,27 @@ mod tests {
         app.phase = Phase::Grid;
         let mut picker = None;
         let mut txb = None;
-        handle_key(press_key(KeyCode::Char(':')), &mut app, &tx, &mut picker, &mut txb, None);
-        handle_key(press_key(KeyCode::Esc), &mut app, &tx, &mut picker, &mut txb, None);
+        let mut sse = None;
+        handle_key(
+            press_key(KeyCode::Char(':')),
+            &mut app,
+            &tx,
+            &mut picker,
+            &mut txb,
+            &mut sse,
+            None,
+            None,
+        );
+        handle_key(
+            press_key(KeyCode::Esc),
+            &mut app,
+            &tx,
+            &mut picker,
+            &mut txb,
+            &mut sse,
+            None,
+            None,
+        );
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.palette.is_none());
     }
@@ -1272,7 +1478,17 @@ mod tests {
         assert_eq!(app.phase, Phase::Connecting);
         let mut picker = None;
         let mut txb = None;
-        handle_key(press_key(KeyCode::Char(':')), &mut app, &tx, &mut picker, &mut txb, None);
+        let mut sse = None;
+        handle_key(
+            press_key(KeyCode::Char(':')),
+            &mut app,
+            &tx,
+            &mut picker,
+            &mut txb,
+            &mut sse,
+            None,
+            None,
+        );
         assert!(app.palette.is_none(), "palette must not open while connecting");
         assert_eq!(app.mode, Mode::Normal, "mode unchanged while connecting");
     }

@@ -152,8 +152,10 @@ pub enum LocalAction {
     SetBaseline(Option<u32>),
     /// Revert to vs-previous diffing.
     ClearBaseline,
-    /// Open the storage picker (`:pin` / `:set-storage` entry point).
+    /// Open the storage picker (`:pin` entry point).
     OpenPicker,
+    /// Open the set-storage editor (`:set-storage` entry point; P2).
+    OpenSetStorage,
     /// Open the transaction builder (`:tx`).
     OpenTxBuilder,
     /// Open the sessions modal (`:sessions`). P4 fills the UI.
@@ -223,7 +225,11 @@ pub fn to_route(parsed: &ParsedCommand) -> std::result::Result<CommandRoute, Par
 
     let route = match parsed.spec.name {
         // RPC commands.
-        "set-storage" => CommandRoute::Local(LocalAction::OpenPicker),
+        // `:set-storage` opens the set-storage editor overlay (target picker →
+        // value editor). The editor dispatches `Command::SetStorage` itself once
+        // the user confirms, so this routes to a local overlay-open, not a direct
+        // dispatch (P2).
+        "set-storage" => CommandRoute::Local(LocalAction::OpenSetStorage),
         "set-head" => {
             let n = parse_block("block", arg(0).ok_or(ParseError::MissingArg("block"))?)?;
             CommandRoute::Dispatch(Command::SetHead(n))
@@ -363,6 +369,15 @@ mod tests {
             CommandRoute::Local(LocalAction::SetBaseline(None)) => {}
             other => panic!("expected SetBaseline(None), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn route_set_storage_opens_editor_overlay() {
+        let p = parse_line("set-storage").unwrap();
+        assert!(matches!(
+            to_route(&p).unwrap(),
+            CommandRoute::Local(LocalAction::OpenSetStorage)
+        ));
     }
 
     #[test]

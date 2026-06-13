@@ -16,3 +16,8 @@ subxt = "0.50.1"
 subxt-signer = "0.50.1"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
+
+[dev-dependencies]
+# Used only by set-storage encoding tests to build an offline type registry.
+# Version pinned to match what subxt 0.50.1 pulls (see Cargo.lock).
+scale-info = { version = "2.11.6", features = ["derive"] }
