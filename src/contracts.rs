@@ -264,16 +264,6 @@ pub struct SetStorageReq {
     pub label: String,
 }
 
-/// How a `time-travel` target is specified. Parser + remaining variants owned by
-/// P4; P0 declares enough for `Command::TimeTravel` to compile.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TimeSpec {
-    /// A unix timestamp in milliseconds.
-    UnixMillis(u64),
-    /// A relative offset like `+6s` / `+1d` (P4 pins the grammar).
-    Relative(String),
-}
-
 /// How a transaction is signed. `Impersonate` requires the fork spawned with
 /// `--mock-signature-host`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,8 +317,9 @@ pub enum Command {
     SetStorage(SetStorageReq),
     /// Rewind / jump the chain head to a block (P4 owns dispatch).
     SetHead(u32),
-    /// Set the chain timestamp (P4 owns dispatch).
-    TimeTravel(TimeSpec),
+    /// Set the chain timestamp (P4 owns dispatch). Payload refined from P0's
+    /// `contracts::TimeSpec` stub to the resolved `session::TimeSpec`.
+    TimeTravel(crate::session::TimeSpec),
     /// Switch the Chopsticks build mode (P3 owns dispatch).
     SetBuildMode(BuildMode),
     /// Build one block from the staged extrinsic queue (P3 owns dispatch).
@@ -367,7 +358,7 @@ mod tests {
                 label: "System.Account = …".into(),
             }),
             Command::SetHead(1030),
-            Command::TimeTravel(TimeSpec::Relative("+6s".into())),
+            Command::TimeTravel(crate::session::TimeSpec::from_epoch_ms(1_750_000_000_000, "+6s")),
             Command::SetBuildMode(BuildMode::Manual),
             Command::BuildWithQueue(vec![]),
             Command::SaveSession("snap".into()),
@@ -375,6 +366,16 @@ mod tests {
         ];
         let _again = cmds.clone();
         assert_eq!(cmds.len(), 7);
+    }
+
+    #[test]
+    fn p4_command_variants_exist() {
+        use crate::session::TimeSpec;
+        // Construct each variant to pin its shape.
+        let _ = Command::SetHead(1030);
+        let _ = Command::TimeTravel(TimeSpec::from_epoch_ms(1_750_000_000_000, "test"));
+        let _ = Command::SaveSession("my-session".to_string());
+        let _ = Command::LoadSession("my-session".to_string());
     }
 
     #[test]
