@@ -8,6 +8,7 @@
 //! (storage picker / tx builder) be held across frames without self-referential
 //! lifetime gymnastics.
 
+pub mod input;
 pub mod resilience;
 
 use std::collections::VecDeque;
