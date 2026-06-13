@@ -811,6 +811,19 @@ fn handle_key(
             return;
         }
         if let Some(cmd) = ed.on_key(key) {
+            // Action-log append seam (freeze §4): record the P2 set-storage edit
+            // here, at the &mut app site, before dispatching it off-thread. Stored
+            // as the raw edits JSON (P2 owns SetStorageReq's shape).
+            if let Command::SetStorage(req) = &cmd {
+                let value_json = match &req.value_hex {
+                    Some(v) => serde_json::Value::String(v.clone()),
+                    None => serde_json::Value::Null,
+                };
+                let edits = serde_json::json!([[&req.key_hex, value_json]]);
+                app.record(RecordedAction::SetStorage {
+                    edits_json: edits.to_string(),
+                });
+            }
             let _ = cmd_tx.send(cmd);
             *set_storage_editor = None;
             app.mode = Mode::Normal;
@@ -1004,11 +1017,23 @@ fn handle_overlay_key(
                 *tx_builder = Some(TxBuilder::new_staging(CuratedCallCatalog));
             }
             PanelAction::Build { queue, timestamp, author } => {
+                // Action-log append seam (freeze §4): record the P3 built block here
+                // (the &mut app site) before dispatching off-thread. The live
+                // PreparedTx has no reversible arg strings, so the record captures
+                // pallet/call/signer (replay re-advances height per §"Replay scope").
+                let extrinsics = queue
+                    .iter()
+                    .map(|tx| crate::session::PreparedTxRecord::from_parts(tx, Vec::new()))
+                    .collect();
+                app.record(RecordedAction::BuiltBlock {
+                    extrinsics,
+                    timestamp,
+                    author: author.clone(),
+                });
                 // Block metadata (timestamp/author) is display-only: the frozen
                 // BuildWithQueue(Vec<PreparedTx>) contract carries no metadata, so
                 // the dispatch helper builds with defaults. Forwarding overrides is
                 // a P0-owned contract extension (shared-contracts §3).
-                let _ = (timestamp, author);
                 let _ = cmd_tx.send(Command::BuildWithQueue(queue));
                 *build_panel = None;
                 app.mode = Mode::Normal;
