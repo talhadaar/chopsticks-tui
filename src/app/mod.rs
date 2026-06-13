@@ -201,6 +201,29 @@ impl AppState {
         self.follow = true;
     }
 
+    /// Set (or move) the baseline. `None` resolves to the newest column's block
+    /// number ("pin the current tip"); if there are no columns it stays `None`.
+    /// `Some(n)` pins that exact block number.
+    pub fn set_baseline(&mut self, block: Option<u32>) {
+        self.baseline = match block {
+            Some(n) => Some(n),
+            None => self.columns.back().map(|c| c.block.number),
+        };
+    }
+
+    /// Clear the baseline, reverting to vs-previous diffing.
+    pub fn clear_baseline(&mut self) {
+        self.baseline = None;
+    }
+
+    /// The column matching the current baseline number, if it is still in the
+    /// ring buffer. Looked up by block **number**, so eviction returns `None`
+    /// rather than silently pointing at a different block.
+    pub fn baseline_column(&self) -> Option<&BlockColumn> {
+        let n = self.baseline?;
+        self.columns.iter().find(|c| c.block.number == n)
+    }
+
     /// Apply a client-side action routed from the palette. P0 owns the seam;
     /// the baseline arms are thin until P1 fills the diff logic. The overlay-
     /// opening arms are handled by the app loop (which owns the overlays), so
@@ -932,6 +955,56 @@ mod tests {
         assert_ne!(stored.id, PinnedItemId(0)); // id was assigned
         app.unpin(stored.id);
         assert!(app.pinned.is_empty());
+    }
+
+    #[test]
+    fn set_baseline_none_resolves_to_newest_column_number() {
+        let mut app = AppState::new();
+        app.push_column(column(10, 1, 100));
+        app.push_column(column(11, 1, 200));
+        // None means "pin the current tip": resolves to the newest column number.
+        app.set_baseline(None);
+        assert_eq!(app.baseline, Some(11));
+    }
+
+    #[test]
+    fn set_baseline_none_with_no_columns_stays_none() {
+        let mut app = AppState::new();
+        app.set_baseline(None);
+        assert_eq!(app.baseline, None);
+    }
+
+    #[test]
+    fn set_baseline_some_pins_that_exact_number() {
+        let mut app = AppState::new();
+        app.push_column(column(10, 1, 100));
+        app.push_column(column(11, 1, 200));
+        app.set_baseline(Some(10));
+        assert_eq!(app.baseline, Some(10));
+    }
+
+    #[test]
+    fn clear_baseline_reverts_to_none() {
+        let mut app = AppState::new();
+        app.push_column(column(10, 1, 100));
+        app.set_baseline(Some(10));
+        app.clear_baseline();
+        assert_eq!(app.baseline, None);
+    }
+
+    #[test]
+    fn baseline_column_looks_up_by_number_not_index() {
+        let mut app = AppState::new();
+        // Fill past MAX_COLUMNS so the oldest columns are evicted and indices shift.
+        for n in 0..(MAX_COLUMNS as u32 + 5) {
+            app.push_column(column(n, 1, n as u128));
+        }
+        // Front is now block #5 (0..4 evicted). A baseline pinned at #5 still
+        // resolves; a baseline at #2 (evicted) does not.
+        app.set_baseline(Some(5));
+        assert_eq!(app.baseline_column().map(|c| c.block.number), Some(5));
+        app.set_baseline(Some(2));
+        assert!(app.baseline_column().is_none());
     }
 
     #[test]
