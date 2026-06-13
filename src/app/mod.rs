@@ -289,6 +289,8 @@ impl AppState {
 
     /// Build the grid view model for the current window.
     pub fn grid_view_model(&self, renderer: &dyn crate::contracts::ValueRenderer) -> GridViewModel {
+        use crate::views::grid::BaselineState;
+
         let total = self.columns.len();
         if total == 0 {
             return GridViewModel::empty();
@@ -300,23 +302,47 @@ impl AppState {
 
         let columns: Vec<u32> = window.iter().map(|c| c.block.number).collect();
 
-        // Per-window-column diff vs the column immediately before it in history.
+        // Resolve the baseline (if any) to a column and classify its state.
+        let baseline_col = self.baseline_column();
+        let baseline_state = match (self.baseline, baseline_col) {
+            (None, _) => BaselineState::Off,
+            (Some(_), Some(_)) => BaselineState::Live,
+            (Some(n), None) => {
+                // Number set but no column: older than the front = evicted,
+                // otherwise newer than everything we hold = pending.
+                let front = self.columns.front().map(|c| c.block.number);
+                if front.is_some_and(|f| n < f) {
+                    BaselineState::Evicted
+                } else {
+                    BaselineState::Pending
+                }
+            }
+        };
+
+        // Per-window-column diff. In Live baseline mode every column diffs
+        // against the frozen baseline column; otherwise (Off, or an
+        // unresolvable baseline) we fall back to vs-previous (MVP-1 default).
         let diffs: Vec<std::collections::BTreeMap<PinnedItemId, CellDiff>> = window
             .iter()
             .enumerate()
             .map(|(j, col)| {
-                let prev_idx = start + j;
-                if prev_idx == 0 {
-                    std::collections::BTreeMap::new()
+                if let (BaselineState::Live, Some(base)) = (baseline_state, baseline_col) {
+                    diff_columns(base, col, renderer, &self.ctx)
                 } else {
-                    let prev = &self.columns[prev_idx - 1];
-                    diff_columns(prev, col, renderer, &self.ctx)
+                    let prev_idx = start + j;
+                    if prev_idx == 0 {
+                        std::collections::BTreeMap::new()
+                    } else {
+                        let prev = &self.columns[prev_idx - 1];
+                        diff_columns(prev, col, renderer, &self.ctx)
+                    }
                 }
             })
             .collect();
 
-        let rows = self
-            .visible_rows()
+        let visible = self.visible_rows();
+
+        let rows: Vec<GridRow> = visible
             .iter()
             .map(|item| {
                 let cells = window
@@ -334,15 +360,35 @@ impl AppState {
             })
             .collect();
 
+        // Frozen baseline column: only materialise it when the baseline is Live
+        // AND it sits outside the visible window (otherwise the window already
+        // shows it — Task 5's guard avoids drawing it twice). The frozen column
+        // is the baseline diffed against itself → all Unchanged (gray).
+        let baseline_column = match (baseline_state, baseline_col) {
+            (BaselineState::Live, Some(base)) if !columns.contains(&base.block.number) => {
+                let self_diff = diff_columns(base, base, renderer, &self.ctx);
+                let frozen = visible
+                    .iter()
+                    .map(|item| {
+                        let diff =
+                            self_diff.get(&item.id).cloned().unwrap_or(CellDiff::Unchanged);
+                        cell_for(base.cells.get(&item.id), &item.path, diff, renderer, &self.ctx)
+                    })
+                    .collect();
+                Some(frozen)
+            }
+            _ => None,
+        };
+
         GridViewModel {
             rows,
             columns,
             scroll: self.row_scroll,
             column_window_start: start,
             follow: self.follow,
-            baseline_block: None,
-            baseline_state: crate::views::grid::BaselineState::Off,
-            baseline_column: None,
+            baseline_block: self.baseline,
+            baseline_state,
+            baseline_column,
         }
     }
 }
@@ -1008,6 +1054,67 @@ mod tests {
         assert_eq!(app.baseline_column().map(|c| c.block.number), Some(5));
         app.set_baseline(Some(2));
         assert!(app.baseline_column().is_none());
+    }
+
+    #[test]
+    fn baseline_none_keeps_vs_previous_behaviour() {
+        // Regression guard: with no baseline, the newest column diffs vs its
+        // immediate predecessor exactly as MVP-1 did.
+        let mut app = AppState::new();
+        app.pinned.push(item(1, "row"));
+        app.push_column(column(10, 1, 100));
+        app.push_column(column(11, 1, 200)); // changed vs #10
+        let model = app.grid_view_model(&DefaultRenderer);
+        assert_eq!(model.baseline_state, crate::views::grid::BaselineState::Off);
+        let newest = model.rows[0].cells.last().unwrap();
+        assert!(matches!(newest.diff, CellDiff::Changed { .. }));
+    }
+
+    #[test]
+    fn baseline_diffs_every_column_against_the_frozen_block() {
+        let mut app = AppState::new();
+        app.pinned.push(item(1, "row"));
+        app.push_column(column(10, 1, 100)); // baseline
+        app.push_column(column(11, 1, 200)); // differs from baseline
+        app.push_column(column(12, 1, 200)); // SAME as #11 but still differs from baseline
+        app.set_baseline(Some(10));
+        let model = app.grid_view_model(&DefaultRenderer);
+        assert_eq!(model.baseline_state, crate::views::grid::BaselineState::Live);
+        assert_eq!(model.baseline_block, Some(10));
+        // window columns are [10, 11, 12]. Cell index aligns with columns.
+        let cells = &model.rows[0].cells;
+        // baseline vs itself → Unchanged
+        assert_eq!(cells[0].diff, CellDiff::Unchanged);
+        // #11 differs from baseline → Changed
+        assert!(matches!(cells[1].diff, CellDiff::Changed { .. }));
+        // #12 == #11 (vs-previous would be Unchanged) but still ≠ baseline → Changed
+        assert!(matches!(cells[2].diff, CellDiff::Changed { .. }));
+    }
+
+    #[test]
+    fn baseline_unresolvable_falls_back_to_vs_previous_and_flags() {
+        let mut app = AppState::new();
+        app.pinned.push(item(1, "row"));
+        // Evict #0..#4 so #5 is the new front; pin a baseline at #2 (gone).
+        for n in 0..(MAX_COLUMNS as u32 + 5) {
+            app.push_column(column(n, 1, n as u128));
+        }
+        app.set_baseline(Some(2)); // evicted
+        let model = app.grid_view_model(&DefaultRenderer);
+        assert_eq!(model.baseline_state, crate::views::grid::BaselineState::Evicted);
+        // Fallback basis is vs-previous: consecutive distinct values are Changed.
+        let cells = &model.rows[0].cells;
+        assert!(matches!(cells.last().unwrap().diff, CellDiff::Changed { .. }));
+    }
+
+    #[test]
+    fn baseline_newer_than_buffer_is_pending() {
+        let mut app = AppState::new();
+        app.pinned.push(item(1, "row"));
+        app.push_column(column(10, 1, 100));
+        app.set_baseline(Some(99)); // not seen yet
+        let model = app.grid_view_model(&DefaultRenderer);
+        assert_eq!(model.baseline_state, crate::views::grid::BaselineState::Pending);
     }
 
     #[test]
