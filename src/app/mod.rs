@@ -546,6 +546,16 @@ fn dispatch(
         // pinned set on each block, so nothing to spawn here.
         Command::Pin(_) | Command::Unpin(_) => {}
         Command::Quit => {}
+        // MVP-2 commands: P0 lands stub arms; owning plans replace them.
+        Command::SetStorage(_)
+        | Command::SetHead(_)
+        | Command::TimeTravel(_)
+        | Command::SetBuildMode(_)
+        | Command::BuildWithQueue(_)
+        | Command::SaveSession(_)
+        | Command::LoadSession(_) => {
+            let _ = evt_tx.send(Event::Error("not yet implemented".into()));
+        }
     }
 }
 
