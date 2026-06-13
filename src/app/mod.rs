@@ -26,8 +26,8 @@ use crate::chain::storage_catalog::MetadataCatalog;
 use crate::chain::{dev_rpc, storage_fetch};
 use crate::chopsticks::Supervisor;
 use crate::contracts::{
-    BlockColumn, CellDiff, CellState, ChainClient, ChopsticksSupervisor, Command, Event, PinnedItem,
-    PinnedItemId, RenderCtx, Result,
+    BlockColumn, BuildMode, CellDiff, CellState, ChainClient, ChopsticksSupervisor, Command, Event,
+    PinnedItem, PinnedItemId, PreparedTx, RenderCtx, Result,
 };
 use crate::render::diff::diff_columns;
 use crate::render::value::DefaultRenderer;
@@ -35,6 +35,10 @@ use crate::views::connection::ConnectionView;
 use crate::views::grid::{GridCell, GridRow, GridView, GridViewModel};
 use crate::views::picker::StoragePicker;
 use crate::views::tx_builder::{ArgKind, ArgSpec, CallCatalog, TxBuilder};
+use crate::app::input::{KeyRouting, Mode, route_key};
+use crate::views::command_registry::{CommandRoute, LocalAction, parse_line, to_route};
+use crate::views::hint_bar::render_hint_bar;
+use crate::views::palette::{CommandPalette, PaletteOutcome};
 
 /// Bounded grid history: the ring buffer keeps the last `MAX_COLUMNS` blocks.
 pub const MAX_COLUMNS: usize = 256;
@@ -71,6 +75,22 @@ pub struct AppState {
     pub banner: Option<String>,
     /// Fuzzy row filter on the pinned label (`[/]`).
     pub filter: String,
+    /// Current input mode (P0): drives key routing + the hint-bar indicator.
+    pub mode: Mode,
+    /// The open command palette, if any (P0).
+    pub palette: Option<CommandPalette>,
+    /// Baseline block for diffing — `None` = vs-previous (P1 owns the logic).
+    pub baseline: Option<u32>,
+    /// Staged extrinsics for `:build` (P3 owns the logic).
+    pub build_queue: Vec<PreparedTx>,
+    /// Current Chopsticks build mode (P3 owns the logic).
+    pub build_mode: BuildMode,
+    /// Ordered replayable session log (P4 owns the type + persistence).
+    #[allow(dead_code)] // element type refined to RecordedAction + populated by P4
+    pub action_log: Vec<crate::contracts::Command>,
+    /// Name of the restored session, if any (P4).
+    #[allow(dead_code)] // populated by P4
+    pub loaded_session: Option<String>,
     pub should_quit: bool,
     next_pin_id: u64,
 }
@@ -95,6 +115,13 @@ impl AppState {
             tx_result: None,
             banner: None,
             filter: String::new(),
+            mode: Mode::Normal,
+            palette: None,
+            baseline: None,
+            build_queue: Vec::new(),
+            build_mode: BuildMode::Manual,
+            action_log: Vec::new(),
+            loaded_session: None,
             should_quit: false,
             next_pin_id: 1,
         }
@@ -172,6 +199,20 @@ impl AppState {
     pub fn jump_newest(&mut self) {
         self.col_offset = 0;
         self.follow = true;
+    }
+
+    /// Apply a client-side action routed from the palette. P0 owns the seam;
+    /// the baseline arms are thin until P1 fills the diff logic. The overlay-
+    /// opening arms are handled by the app loop (which owns the overlays), so
+    /// they are no-ops on state here.
+    pub fn apply_local(&mut self, action: LocalAction) {
+        match action {
+            // P1 replaces these two arms with real baseline mutation.
+            LocalAction::SetBaseline(_block) => {}
+            LocalAction::ClearBaseline => {}
+            // Overlay/modal opens are performed by the loop, not by state.
+            LocalAction::OpenPicker | LocalAction::OpenTxBuilder | LocalAction::OpenSessions => {}
+        }
     }
 
     /// Grid-level key handling (overlays/connection are routed in `run`). Returns
@@ -451,7 +492,7 @@ fn handle_key(
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
     catalog: Option<&'static MetadataCatalog<'static>>,
 ) {
-    // Connecting: drive the connection form.
+    // Connecting: drive the connection form (unchanged MVP-1 behavior).
     if app.phase == Phase::Connecting {
         if let Some(cmd) = app.connection.on_key(key) {
             let _ = cmd_tx.send(cmd);
@@ -459,22 +500,118 @@ fn handle_key(
         return;
     }
 
-    // Overlay open: route to it; Esc closes.
+    match route_key(app.mode, key) {
+        KeyRouting::OpenPalette => {
+            app.palette = Some(CommandPalette::new());
+            app.mode = Mode::Command;
+        }
+        KeyRouting::OpenPicker => {
+            if let Some(cat) = catalog {
+                *picker = Some(StoragePicker::new(cat));
+                app.mode = Mode::Insert;
+            }
+        }
+        KeyRouting::OpenTxBuilder => {
+            *tx_builder = Some(TxBuilder::new(CuratedCallCatalog));
+            app.mode = Mode::Insert;
+        }
+        KeyRouting::Grid(key) => {
+            for cmd in app.on_key(key) {
+                let _ = cmd_tx.send(cmd);
+            }
+        }
+        KeyRouting::Palette(key) => {
+            handle_palette_key(key, app, cmd_tx, picker, tx_builder, catalog);
+        }
+        KeyRouting::Overlay(key) => {
+            handle_overlay_key(key, app, cmd_tx, picker, tx_builder);
+        }
+    }
+}
+
+/// Feed a key to the open palette and act on its outcome. Owns the Command→Normal
+/// transition and the parse/route → dispatch-or-local plumbing.
+fn handle_palette_key(
+    key: KeyEvent,
+    app: &mut AppState,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
+    picker: &mut Option<StoragePicker<'static>>,
+    tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+    catalog: Option<&'static MetadataCatalog<'static>>,
+) {
+    let outcome = match app.palette.as_mut() {
+        Some(p) => p.on_key(key),
+        None => {
+            app.mode = Mode::Normal;
+            return;
+        }
+    };
+    match outcome {
+        PaletteOutcome::Pending => {}
+        PaletteOutcome::Cancel => {
+            app.palette = None;
+            app.mode = Mode::Normal;
+        }
+        PaletteOutcome::Submit(line) => {
+            app.palette = None;
+            app.mode = Mode::Normal;
+            match parse_line(&line).and_then(|p| to_route(&p)) {
+                Ok(CommandRoute::Dispatch(cmd)) => {
+                    let _ = cmd_tx.send(cmd);
+                }
+                Ok(CommandRoute::Local(action)) => {
+                    // Overlay-opening locals are performed here (the loop owns the
+                    // overlays); the rest go through apply_local.
+                    match action {
+                        LocalAction::OpenPicker => {
+                            if let Some(cat) = catalog {
+                                *picker = Some(StoragePicker::new(cat));
+                                app.mode = Mode::Insert;
+                            }
+                        }
+                        LocalAction::OpenTxBuilder => {
+                            *tx_builder = Some(TxBuilder::new(CuratedCallCatalog));
+                            app.mode = Mode::Insert;
+                        }
+                        other => app.apply_local(other),
+                    }
+                }
+                Err(e) => {
+                    app.banner = Some(format!("command: {e}"));
+                }
+            }
+        }
+    }
+}
+
+/// Feed a key to whichever overlay is open (Insert mode). Mirrors MVP-1's overlay
+/// routing exactly: Esc closes (→ Normal); the picker emits Pin; the tx builder
+/// emits its command.
+fn handle_overlay_key(
+    key: KeyEvent,
+    app: &mut AppState,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
+    picker: &mut Option<StoragePicker<'static>>,
+    tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+) {
     if let Some(p) = picker.as_mut() {
         if key.code == KeyCode::Esc {
             *picker = None;
+            app.mode = Mode::Normal;
             return;
         }
         if let Some(Command::Pin(item)) = p.on_key(key) {
             app.pin(item.clone());
             let _ = cmd_tx.send(Command::Pin(item));
             *picker = None;
+            app.mode = Mode::Normal;
         }
         return;
     }
     if let Some(tb) = tx_builder.as_mut() {
         if key.code == KeyCode::Esc {
             *tx_builder = None;
+            app.mode = Mode::Normal;
             return;
         }
         if let Some(cmd) = tb.on_key(key) {
@@ -482,23 +619,8 @@ fn handle_key(
         }
         return;
     }
-
-    // Grid: 'p'/'t' open overlays; everything else is grid navigation.
-    match key.code {
-        KeyCode::Char('p') => {
-            if let Some(cat) = catalog {
-                *picker = Some(StoragePicker::new(cat));
-            }
-        }
-        KeyCode::Char('t') => {
-            *tx_builder = Some(TxBuilder::new(CuratedCallCatalog));
-        }
-        _ => {
-            for cmd in app.on_key(key) {
-                let _ = cmd_tx.send(cmd);
-            }
-        }
-    }
+    // No overlay actually open (mode drift): snap back to Normal.
+    app.mode = Mode::Normal;
 }
 
 /// Act on a UI command: spawn the matching background task.
@@ -645,11 +767,12 @@ fn render(
     match app.phase {
         Phase::Connecting => app.connection.render(f, area),
         Phase::Grid => {
-            // banner (optional) + grid + tx-result panel.
+            // banner (optional) + grid + tx-result panel + hint bar.
             let chunks = Layout::vertical([
                 Constraint::Length(if app.banner.is_some() { 1 } else { 0 }),
                 Constraint::Min(3),
                 Constraint::Length(if app.tx_result.is_some() { 4 } else { 0 }),
+                Constraint::Length(1),
             ])
             .split(area);
 
@@ -682,7 +805,9 @@ fn render(
                 );
             }
 
-            // Overlays draw on top in a centered area.
+            render_hint_bar(f, chunks[3], app.mode);
+
+            // Overlays draw on top in a centered area; the palette anchors itself.
             if let Some(p) = picker {
                 let a = centered(area, 70, 70);
                 f.render_widget(Clear, a);
@@ -691,6 +816,8 @@ fn render(
                 let a = centered(area, 70, 70);
                 f.render_widget(Clear, a);
                 tb.render(f, a);
+            } else if let Some(pal) = &app.palette {
+                pal.render(f, area);
             }
         }
     }
@@ -817,5 +944,76 @@ mod tests {
         }));
         assert!(app.tx_result.is_some());
         assert_eq!(app.columns.len(), before);
+    }
+
+    use crate::app::input::Mode;
+    use crate::views::command_registry::LocalAction;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn app_starts_in_normal_mode_with_no_palette() {
+        let app = AppState::new();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.palette.is_none());
+        assert!(app.baseline.is_none());
+        assert!(app.build_queue.is_empty());
+        assert_eq!(app.build_mode, crate::contracts::BuildMode::Manual);
+        assert!(app.action_log.is_empty());
+        assert!(app.loaded_session.is_none());
+    }
+
+    #[test]
+    fn apply_local_open_picker_is_a_noop_on_state() {
+        // P0 routes OpenPicker via the loop (opening the overlay), not apply_local;
+        // baseline arms are thin until P1. apply_local must not panic on any arm.
+        let mut app = AppState::new();
+        app.apply_local(LocalAction::ClearBaseline);
+        app.apply_local(LocalAction::SetBaseline(Some(42)));
+        app.apply_local(LocalAction::OpenPicker);
+        app.apply_local(LocalAction::OpenTxBuilder);
+        app.apply_local(LocalAction::OpenSessions);
+        // No state assertion beyond "did not panic"; P1 fills baseline behavior.
+    }
+
+    #[test]
+    fn grid_render_includes_hint_bar() {
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        app.push_column(column(1, 1, 1));
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &app, &DefaultRenderer, None, None)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("NORMAL"), "hint bar mode indicator must render: {dump}");
+    }
+
+    fn press_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn colon_enters_command_mode_and_opens_palette() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        let mut picker = None;
+        let mut txb = None;
+        handle_key(press_key(KeyCode::Char(':')), &mut app, &tx, &mut picker, &mut txb, None);
+        assert_eq!(app.mode, Mode::Command);
+        assert!(app.palette.is_some());
+    }
+
+    #[test]
+    fn esc_in_command_mode_closes_palette_back_to_normal() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        let mut picker = None;
+        let mut txb = None;
+        handle_key(press_key(KeyCode::Char(':')), &mut app, &tx, &mut picker, &mut txb, None);
+        handle_key(press_key(KeyCode::Esc), &mut app, &tx, &mut picker, &mut txb, None);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.palette.is_none());
     }
 }
