@@ -371,6 +371,14 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Test-only serialization guard for tests that mutate the process-global
+/// `CHOPSTICKS_TUI_SESSIONS_DIR` env var. `std::env::set_var` is process-wide, so
+/// concurrent session tests would clobber each other's directory; hold this lock
+/// for the duration of any test that sets it. Lives here so both `session::tests`
+/// and `app::tests` share one lock.
+#[cfg(test)]
+pub static SESSIONS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,9 +505,10 @@ mod tests {
     #[test]
     fn session_round_trips_through_disk() {
         use crate::contracts::{BuildMode, ForkConfig, KeyArg, PinnedItem, PinnedItemId};
+        let _guard = SESSIONS_ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("ctui-sess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // SAFETY: single-threaded test; we set the override for this process only.
+        // SAFETY: serialized by SESSIONS_ENV_LOCK; we set the override for this process.
         unsafe {
             std::env::set_var("CHOPSTICKS_TUI_SESSIONS_DIR", &dir);
         }

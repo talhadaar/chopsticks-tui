@@ -31,6 +31,7 @@ use crate::contracts::{
 };
 use crate::render::diff::diff_columns;
 use crate::render::value::DefaultRenderer;
+use crate::session::{self, RecordedAction, Session, SessionSource};
 use crate::views::connection::ConnectionView;
 use crate::views::grid::{GridCell, GridRow, GridView, GridViewModel};
 use crate::views::picker::StoragePicker;
@@ -87,12 +88,18 @@ pub struct AppState {
     pub build_queue: Vec<PreparedTx>,
     /// Current Chopsticks build mode (P3 owns the logic).
     pub build_mode: BuildMode,
-    /// Ordered replayable session log (P4 owns the type + persistence).
-    #[allow(dead_code)] // element type refined to RecordedAction + populated by P4
-    pub action_log: Vec<crate::contracts::Command>,
-    /// Name of the restored session, if any (P4).
-    #[allow(dead_code)] // populated by P4
+    /// Ordered replayable session log (freeze §4). P2/P3/P4 append via `record`.
+    pub action_log: Vec<RecordedAction>,
+    /// Name of the currently-restored (or just-saved) session, if any (P4).
     pub loaded_session: Option<String>,
+    /// The fork config in use, captured at connect (for session save/restore).
+    pub fork: Option<crate::contracts::ForkConfig>,
+    /// Amber off-timeline badge: `Some(n)` once the head was rewound to `n`.
+    pub off_timeline_from: Option<u32>,
+    /// Recorded actions awaiting replay during a session restore (front = next).
+    pub replay_queue: VecDeque<RecordedAction>,
+    /// Expected head height of a session being restored, for drift detection.
+    pub expected_restore_head: Option<u32>,
     pub should_quit: bool,
     next_pin_id: u64,
 }
@@ -124,6 +131,10 @@ impl AppState {
             build_mode: BuildMode::Manual,
             action_log: Vec::new(),
             loaded_session: None,
+            fork: None,
+            off_timeline_from: None,
+            replay_queue: VecDeque::new(),
+            expected_restore_head: None,
             should_quit: false,
             next_pin_id: 1,
         }
@@ -176,6 +187,160 @@ impl AppState {
 
     pub fn unpin(&mut self, id: PinnedItemId) {
         self.pinned.retain(|p| p.id != id);
+    }
+
+    /// Append a state-changing dev action to the replayable log (freeze §4).
+    /// No-op-safe: callers (P2/P3/P4) invoke this in the same place they apply
+    /// the effect; it never fails.
+    pub fn record(&mut self, action: RecordedAction) {
+        self.action_log.push(action);
+    }
+
+    /// Build the session payload for the *current* state (fork + pins + baseline +
+    /// action log + head). Used both for manual saves and auto-snapshots.
+    pub fn to_session(&self, name: &str, source: SessionSource) -> Session {
+        let head = self.columns.back().map(|c| c.block.number).unwrap_or(0);
+        Session {
+            name: name.to_string(),
+            // A session with no fork is meaningless; fall back to an Attach stub
+            // so serialization never panics. Restore will surface a drift error.
+            fork: self
+                .fork
+                .clone()
+                .unwrap_or(crate::contracts::ForkConfig::Attach { url: String::new() }),
+            pins: self.pinned.clone(),
+            baseline: self.baseline,
+            actions: self.action_log.clone(),
+            head,
+            source,
+        }
+    }
+
+    /// `set-head` core (spec §7.1): snapshot-then-truncate. Saves the abandoned
+    /// future as an auto-named session, drops every column past `new_head`,
+    /// records the `SetHead` action, and raises the amber off-timeline banner.
+    /// Returns the auto-snapshot session name. The `dev_setHead` RPC + the
+    /// fresh-forward build are issued separately by the dispatch loop.
+    pub fn snapshot_and_truncate(&mut self, new_head: u32) -> Result<String> {
+        let old_tip = self.columns.back().map(|c| c.block.number).unwrap_or(new_head);
+        let snap_name = session::auto_snapshot_name(old_tip);
+
+        // 1. Snapshot the abandoned future (the full current state, head = old tip).
+        let snapshot = self.to_session(&snap_name, SessionSource::AutoSnapshot);
+        session::save_session(&snapshot)?;
+
+        // 2. Drop columns past the new head; the grid ends cleanly at new_head.
+        self.columns.retain(|c| c.block.number <= new_head);
+        self.col_offset = 0;
+        self.follow = true;
+
+        // 3. Record + raise off-timeline state.
+        self.record(RecordedAction::SetHead(new_head));
+        self.off_timeline_from = Some(new_head);
+        self.banner = Some(format!(
+            "⏳ Head rewound to #{new_head}. Abandoned future → session \"{snap_name}\"."
+        ));
+
+        Ok(snap_name)
+    }
+
+    /// Apply the in-UI-loop portion of a P4 command and return follow-up
+    /// `Command`s the dispatch loop should spawn (RPC + builds). Mirrors how
+    /// `Pin` is applied to state in the loop while a fetch is spawned. Commands
+    /// not handled here return no follow-ups.
+    pub fn on_command_local(&mut self, cmd: Command) -> Vec<Command> {
+        match cmd {
+            Command::SetHead(block) => {
+                // State effect: snapshot the future + truncate the grid. On a
+                // failed snapshot, surface the error but still re-fork.
+                if let Err(e) = self.snapshot_and_truncate(block) {
+                    self.banner = Some(format!("set-head snapshot failed: {e}"));
+                }
+                // Follow-up: the actual dev_setHead RPC re-forks the live chain;
+                // building forward then resumes via the normal block subscription.
+                vec![Command::SetHead(block)]
+            }
+            Command::TimeTravel(spec) => {
+                self.record(RecordedAction::TimeTravel(spec.clone()));
+                self.banner = Some(format!("⏳ time-travelled to {}", spec.source));
+                vec![Command::TimeTravel(spec)]
+            }
+            Command::SaveSession(name) => {
+                let session = self.to_session(&name, SessionSource::Manual);
+                match session::save_session(&session) {
+                    Ok(()) => {
+                        self.loaded_session = Some(name.clone());
+                        self.banner = Some(format!("saved session \"{name}\""));
+                    }
+                    Err(e) => self.banner = Some(format!("save failed: {e}")),
+                }
+                vec![]
+            }
+            Command::LoadSession(name) => match session::load_session(&name) {
+                Ok(session) => self.begin_restore(session),
+                Err(e) => {
+                    self.banner = Some(format!("load failed: {e}"));
+                    vec![]
+                }
+            },
+            // Non-P4 commands are not handled here.
+            _ => vec![],
+        }
+    }
+
+    /// Begin restoring a loaded session: apply the chain-independent state (pins,
+    /// baseline, name, expected head, replay queue) and emit a `Connect` to
+    /// re-fork via the existing supervisor path (`spawn_connect`). The replay
+    /// queue is drained as the re-forked chain comes up.
+    fn begin_restore(&mut self, session: Session) -> Vec<Command> {
+        self.pinned = session.pins;
+        self.baseline = session.baseline;
+        self.loaded_session = Some(session.name);
+        self.expected_restore_head = Some(session.head);
+        self.replay_queue = session.actions.into_iter().collect();
+        // Reset the live grid; the re-fork rebuilds it.
+        self.columns.clear();
+        self.col_offset = 0;
+        self.follow = true;
+        self.off_timeline_from = None;
+        self.fork = Some(session.fork.clone());
+        vec![Command::Connect(session.fork)]
+    }
+
+    /// Pop the next recorded action and translate it into the `Command` that
+    /// reproduces it, or `None` when the queue is drained. Actions with no P4
+    /// command yet (e.g. `SetStorage`/`SetBuildMode`, owned by P2/P3) are skipped,
+    /// advancing to the next replayable action.
+    pub fn drain_next_replay(&mut self) -> Option<Command> {
+        while let Some(action) = self.replay_queue.pop_front() {
+            match action {
+                RecordedAction::SetHead(b) => return Some(Command::SetHead(b)),
+                RecordedAction::TimeTravel(spec) => return Some(Command::TimeTravel(spec)),
+                // Replay a built block as an empty +6s build (advances height).
+                // Full re-staging of `extrinsics` lands when P3's tx machinery is
+                // available (see plan §"Replay scope note").
+                RecordedAction::BuiltBlock { .. } => return Some(Command::BuildBlock),
+                // P2/P3 own these commands; until full replay lands, skip (no
+                // panic, no silent corruption — the action stays in the file).
+                RecordedAction::SetStorage { .. } | RecordedAction::SetBuildMode(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// Note the head height reached during a restore; warn on base drift (spec
+    /// §8 risk / §11 open question). "Drift" = the re-forked tip differs from the
+    /// expected saved head once replay has finished advancing the chain.
+    pub fn note_restore_progress(&mut self, current_head: u32) {
+        if let Some(expected) = self.expected_restore_head
+            && self.replay_queue.is_empty()
+            && current_head != expected
+        {
+            self.banner = Some(format!(
+                "⚠ session base drift: expected head #{expected}, restored to #{current_head}"
+            ));
+            self.expected_restore_head = None;
+        }
     }
 
     /// Scroll one column toward the past; pauses follow.
@@ -579,15 +744,33 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
             Some(block) = block_rx.recv() => {
                 match block {
                     Ok(blk) => {
+                        let number = blk.number;
                         if let Some(c) = client {
                             spawn_fetch_column(c, blk, app.pinned.clone(), evt_tx.clone());
                         }
+                        // Restore in progress: advance the replay queue one step
+                        // per new block, then check for base drift once drained.
+                        if !app.replay_queue.is_empty()
+                            && let Some(cmd) = app.drain_next_replay()
+                        {
+                            let _ = cmd_tx.send(cmd);
+                        }
+                        app.note_restore_progress(number);
                     }
                     Err(e) => { let _ = evt_tx.send(Event::Disconnected(e.to_string())); }
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
-                dispatch(cmd, client, &evt_tx, &client_tx, app.pinned.clone());
+                // P4 commands have an in-loop state effect (snapshot/save/load)
+                // that also produces follow-up RPC commands; route them first.
+                let followups = if is_p4_command(&cmd) {
+                    app.on_command_local(cmd)
+                } else {
+                    vec![cmd]
+                };
+                for f in followups {
+                    dispatch(f, client, &evt_tx, &client_tx, app.pinned.clone());
+                }
             }
         }
     }
@@ -610,6 +793,10 @@ fn handle_key(
     // Connecting: drive the connection form (unchanged MVP-1 behavior).
     if app.phase == Phase::Connecting {
         if let Some(cmd) = app.connection.on_key(key) {
+            // Capture the fork config so session save/restore has it (P4).
+            if let Command::Connect(cfg) = &cmd {
+                app.fork = Some(cfg.clone());
+            }
             let _ = cmd_tx.send(cmd);
         }
         return;
@@ -921,14 +1108,48 @@ fn dispatch(
                 });
             }
         }
-        // Remaining MVP-2 commands: P0 lands stub arms; owning plans replace them.
-        Command::SetHead(_)
-        | Command::TimeTravel(_)
-        | Command::SaveSession(_)
-        | Command::LoadSession(_) => {
-            let _ = evt_tx.send(Event::Error("not yet implemented".into()));
+        // MVP-2 P4: re-fork the live chain head. The state effect (snapshot +
+        // truncate) already ran in the UI loop via `on_command_local`; this arm
+        // issues the actual `dev_setHead` RPC.
+        Command::SetHead(block) => {
+            if let Some(c) = client {
+                let rpc = c.rpc().clone();
+                let evt = evt_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dev_rpc::set_head(&rpc, block).await {
+                        let _ = evt.send(Event::Error(format!("set-head: {e}")));
+                    }
+                });
+            }
         }
+        // MVP-2 P4: set the chain timestamp.
+        Command::TimeTravel(spec) => {
+            if let Some(c) = client {
+                let rpc = c.rpc().clone();
+                let evt = evt_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dev_rpc::time_travel(&rpc, &spec).await {
+                        let _ = evt.send(Event::Error(format!("time-travel: {e}")));
+                    }
+                });
+            }
+        }
+        // P4: SaveSession/LoadSession are applied to AppState in the UI loop
+        // (via on_command_local); nothing to spawn here.
+        Command::SaveSession(_) | Command::LoadSession(_) => {}
     }
+}
+
+/// P4 commands carry an in-loop state effect handled by `AppState::on_command_local`
+/// before any RPC follow-up is dispatched.
+fn is_p4_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::SetHead(_)
+            | Command::TimeTravel(_)
+            | Command::SaveSession(_)
+            | Command::LoadSession(_)
+    )
 }
 
 /// Spawn the connect flow: start the supervisor (forwarding boot logs), connect
@@ -1464,6 +1685,164 @@ mod tests {
         assert_eq!(app.build_mode, crate::contracts::BuildMode::Manual);
         assert!(app.action_log.is_empty());
         assert!(app.loaded_session.is_none());
+    }
+
+    use crate::session::SessionSource;
+
+    #[test]
+    fn snapshot_and_truncate_rewinds_columns_and_snapshots_future() {
+        use crate::contracts::{BuildMode, ForkConfig};
+        let _guard = crate::session::SESSIONS_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("ctui-sh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by SESSIONS_ENV_LOCK.
+        unsafe {
+            std::env::set_var("CHOPSTICKS_TUI_SESSIONS_DIR", &dir);
+        }
+
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        app.fork = Some(ForkConfig::Spawn {
+            chain_or_path: "polkadot".into(),
+            build_mode: BuildMode::Manual,
+            mock_signature_host: false,
+        });
+        app.pinned.push(item(1, "row"));
+        for n in 1028..=1045 {
+            app.push_column(column(n, 1, n as u128));
+        }
+        assert_eq!(app.columns.back().unwrap().block.number, 1045);
+
+        let snap = app.snapshot_and_truncate(1030).expect("snapshot ok");
+
+        assert_eq!(app.columns.back().unwrap().block.number, 1030);
+        assert!(app.columns.iter().all(|c| c.block.number <= 1030));
+        assert_eq!(app.off_timeline_from, Some(1030));
+        assert!(app.banner.as_deref().unwrap().contains("timeline-#1045"));
+        assert!(matches!(app.action_log.last(), Some(RecordedAction::SetHead(1030))));
+        assert_eq!(snap, "timeline-#1045");
+        let loaded = session::load_session("timeline-#1045").unwrap();
+        assert_eq!(loaded.head, 1045);
+        assert_eq!(loaded.source, SessionSource::AutoSnapshot);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_head_command_truncates_and_emits_followups() {
+        use crate::contracts::{BuildMode, ForkConfig};
+        let _guard = crate::session::SESSIONS_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("ctui-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by SESSIONS_ENV_LOCK.
+        unsafe {
+            std::env::set_var("CHOPSTICKS_TUI_SESSIONS_DIR", &dir);
+        }
+
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        app.fork = Some(ForkConfig::Spawn {
+            chain_or_path: "polkadot".into(),
+            build_mode: BuildMode::Manual,
+            mock_signature_host: false,
+        });
+        for n in 1028..=1045 {
+            app.push_column(column(n, 1, n as u128));
+        }
+        let follow = app.on_command_local(Command::SetHead(1030));
+        assert_eq!(app.columns.back().unwrap().block.number, 1030);
+        assert!(follow.iter().any(|c| matches!(c, Command::SetHead(1030))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_session_command_persists_named_session() {
+        let _guard = crate::session::SESSIONS_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("ctui-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by SESSIONS_ENV_LOCK.
+        unsafe {
+            std::env::set_var("CHOPSTICKS_TUI_SESSIONS_DIR", &dir);
+        }
+
+        let mut app = AppState::new();
+        app.fork = Some(crate::contracts::ForkConfig::Attach { url: "ws://x".into() });
+        app.push_column(column(7, 1, 1));
+        let follow = app.on_command_local(Command::SaveSession("manual-1".into()));
+        assert!(follow.is_empty());
+        let loaded = crate::session::load_session("manual-1").unwrap();
+        assert_eq!(loaded.name, "manual-1");
+        assert_eq!(loaded.head, 7);
+        assert_eq!(loaded.source, SessionSource::Manual);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn begin_restore_refork_and_queues_replay() {
+        use crate::contracts::{BuildMode, ForkConfig};
+        use crate::session::{RecordedAction, Session, SessionSource, TimeSpec};
+        let mut app = AppState::new();
+        let session = Session {
+            name: "repro".into(),
+            fork: ForkConfig::Spawn {
+                chain_or_path: "polkadot".into(),
+                build_mode: BuildMode::Manual,
+                mock_signature_host: false,
+            },
+            pins: vec![item(1, "row")],
+            baseline: Some(1000),
+            actions: vec![
+                RecordedAction::SetHead(1005),
+                RecordedAction::TimeTravel(TimeSpec::from_epoch_ms(1_750_000_000_000, "+1d")),
+            ],
+            head: 1010,
+            source: SessionSource::Manual,
+        };
+        let follow = app.begin_restore(session.clone());
+        assert!(matches!(follow.first(), Some(Command::Connect(_))));
+        assert_eq!(app.pinned.len(), 1);
+        assert_eq!(app.baseline, Some(1000));
+        assert_eq!(app.loaded_session.as_deref(), Some("repro"));
+        assert_eq!(app.replay_queue.len(), 2);
+    }
+
+    #[test]
+    fn drain_replay_queue_emits_commands_in_order() {
+        use crate::session::{RecordedAction, TimeSpec};
+        let mut app = AppState::new();
+        app.replay_queue = std::collections::VecDeque::from(vec![
+            RecordedAction::TimeTravel(TimeSpec::from_epoch_ms(1_750_000_000_000, "+1d")),
+            RecordedAction::SetBuildMode(crate::contracts::BuildMode::Instant),
+            RecordedAction::BuiltBlock { extrinsics: vec![], timestamp: None, author: None },
+        ]);
+        let c1 = app.drain_next_replay();
+        assert!(matches!(c1, Some(Command::TimeTravel(_))));
+        // SetBuildMode is skipped (P3 owns it) → next is the BuiltBlock build.
+        let c2 = app.drain_next_replay();
+        assert!(matches!(c2, Some(Command::BuildBlock)));
+        assert!(app.replay_queue.is_empty());
+        assert!(app.drain_next_replay().is_none());
+    }
+
+    #[test]
+    fn restore_warns_on_base_drift() {
+        let mut app = AppState::new();
+        app.expected_restore_head = Some(1010);
+        app.note_restore_progress(1008);
+        assert!(app.banner.as_deref().unwrap().contains("drift"));
+    }
+
+    #[test]
+    fn record_appends_to_action_log() {
+        use crate::session::RecordedAction;
+        let mut app = AppState::new();
+        assert!(app.action_log.is_empty());
+        app.record(RecordedAction::SetHead(1030));
+        app.record(RecordedAction::SetBuildMode(crate::contracts::BuildMode::Instant));
+        assert_eq!(app.action_log.len(), 2);
+        assert!(matches!(app.action_log[0], RecordedAction::SetHead(1030)));
     }
 
     #[test]
