@@ -207,11 +207,14 @@ impl AppState {
     /// they are no-ops on state here.
     pub fn apply_local(&mut self, action: LocalAction) {
         match action {
-            // P1 replaces these two arms with real baseline mutation.
-            LocalAction::SetBaseline(_block) => {}
-            LocalAction::ClearBaseline => {}
+            // Deferred to later MVP-2 phases: surface feedback instead of a silent
+            // no-op, matching the RPC stubs' "not yet implemented". P1 replaces the
+            // baseline arms with real mutation; P4 wires up sessions.
+            LocalAction::SetBaseline(_) | LocalAction::ClearBaseline | LocalAction::OpenSessions => {
+                self.banner = Some("not yet implemented".into());
+            }
             // Overlay/modal opens are performed by the loop, not by state.
-            LocalAction::OpenPicker | LocalAction::OpenTxBuilder | LocalAction::OpenSessions => {}
+            LocalAction::OpenPicker | LocalAction::OpenTxBuilder => {}
         }
     }
 
