@@ -30,7 +30,9 @@ use subxt::utils::{AccountId32, H256, MultiSignature};
 use subxt::{OnlineClient, PolkadotConfig, rpcs::RpcClient, rpcs::client::rpc_params};
 use subxt_signer::sr25519::{Keypair, dev};
 
-use crate::contracts::{BlockRef, DevAccount, EventSummary, PreparedTx, Result, TxOutcome, TxSigner};
+use crate::contracts::{
+    BlockRef, BuildMode, DevAccount, EventSummary, PreparedTx, Result, TxOutcome, TxSigner,
+};
 
 /// Build one block via `dev_newBlock` and report the new head as a `BlockRef`.
 ///
@@ -44,6 +46,26 @@ pub(crate) async fn new_block(rpc: &RpcClient) -> Result<BlockRef> {
     let number = parse_header_number(&header)?;
 
     Ok(BlockRef { number, hash })
+}
+
+/// Map our [`BuildMode`] to the integer Chopsticks' `dev_setBlockBuildMode`
+/// expects (`Batch = 0`, `Instant = 1`, `Manual = 2`).
+fn build_mode_index(mode: BuildMode) -> u8 {
+    match mode {
+        BuildMode::Batch => 0,
+        BuildMode::Instant => 1,
+        BuildMode::Manual => 2,
+    }
+}
+
+/// Switch the Chopsticks block-build mode via `dev_setBlockBuildMode`.
+///
+/// Integration-tested only (live RPC), per this module's validation policy.
+pub(crate) async fn set_block_build_mode(rpc: &RpcClient, mode: BuildMode) -> Result<()> {
+    let _: serde_json::Value = rpc
+        .request("dev_setBlockBuildMode", rpc_params![build_mode_index(mode)])
+        .await?;
+    Ok(())
 }
 
 /// Submit a prepared extrinsic and resolve once it is included, decoding the
@@ -61,6 +83,51 @@ pub(crate) async fn submit(inner: &OnlineClient<PolkadotConfig>, tx: PreparedTx)
             submit_with(inner, &payload, &MockSigner::new(*account)).await
         }
     }
+}
+
+/// Build one block containing every staged extrinsic (MVP-2 build panel).
+///
+/// Mechanism (Manual mode): submit each `PreparedTx` into the pool *without*
+/// awaiting inclusion (each `submit` future only resolves once a block exists,
+/// so awaiting before building would deadlock), then call `dev_newBlock` once.
+/// Chopsticks bundles all pooled extrinsics into the single new block, which the
+/// block subscription then surfaces as a grid column. An empty queue just builds
+/// an empty block (same as the `b` fast path).
+///
+/// Block metadata overrides (timestamp / author) are panel-local and DISPLAY-ONLY:
+/// the frozen `BuildWithQueue(Vec<PreparedTx>)` contract carries no metadata, so
+/// this helper always builds with Chopsticks' defaults. Forwarding overrides is a
+/// P0-owned contract extension (shared-contracts §3 note).
+///
+/// Integration-tested only (live RPC), per this module's validation policy.
+pub(crate) async fn build_with_queue(
+    inner: &OnlineClient<PolkadotConfig>,
+    rpc: &RpcClient,
+    queue: Vec<PreparedTx>,
+) -> Result<()> {
+    // Fire each submission into the pool; do not await inclusion (Manual mode).
+    let mut handles = Vec::with_capacity(queue.len());
+    for tx in queue {
+        let inner = inner.clone();
+        handles.push(tokio::spawn(async move {
+            // Errors here surface as a missing extrinsic in the built block; we
+            // don't fail the whole build for one bad tx. (A future refinement
+            // could collect per-tx outcomes.)
+            let _ = submit(&inner, tx).await;
+        }));
+    }
+    // Give Chopsticks a beat to admit the extrinsics to the pool before sealing.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Seal one block over the pooled extrinsics.
+    new_block(rpc).await?;
+
+    // The submission futures resolve once the block is built; let them finish so
+    // their watchers don't leak, but we don't depend on their outcomes here.
+    for h in handles {
+        let _ = h.await;
+    }
+    Ok(())
 }
 
 /// Submit `payload` signed by `signer`, await inclusion, and decode the outcome.
@@ -257,6 +324,14 @@ mod tests {
             }
             other => panic!("expected a sentinel sr25519 signature, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_mode_maps_to_chopsticks_index() {
+        use crate::contracts::BuildMode;
+        assert_eq!(build_mode_index(BuildMode::Batch), 0);
+        assert_eq!(build_mode_index(BuildMode::Instant), 1);
+        assert_eq!(build_mode_index(BuildMode::Manual), 2);
     }
 
     #[test]
