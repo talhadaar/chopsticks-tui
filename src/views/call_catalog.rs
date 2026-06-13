@@ -7,7 +7,7 @@ use scale_value::Value;
 use scale_value::scale::encode_as_type;
 use subxt::Metadata;
 
-use crate::views::tx_builder::{ArgKind, ArgSpec, CallCatalog};
+use crate::views::tx_builder::{ArgKind, ArgSpec, CallCatalog, EncodedCall};
 
 /// A [`CallCatalog`] backed by the connected runtime's metadata.
 pub struct MetadataCallCatalog<'a> {
@@ -97,6 +97,54 @@ impl CallCatalog for MetadataCallCatalog<'_> {
                 ArgSpec::typed(name, infer_kind(type_id, types), type_id)
             })
             .collect()
+    }
+
+    fn encode_call(
+        &self,
+        pallet: &str,
+        call: &str,
+        args: &[Value<()>],
+    ) -> std::result::Result<Option<EncodedCall>, String> {
+        let Some(p) = self.metadata.pallet_by_name(pallet) else {
+            return Err(format!("unknown pallet `{pallet}`"));
+        };
+        let Some(variant) = p.call_variant_by_name(call) else {
+            return Err(format!("unknown call `{pallet}.{call}`"));
+        };
+        let types = self.metadata.types();
+        let mut coerced = Vec::with_capacity(args.len());
+        let mut bytes = Vec::new();
+        for (field, value) in variant.fields.iter().zip(args) {
+            let type_id = field.ty.id;
+            let name = field.name.clone().unwrap_or_default();
+            let (value, mut arg_bytes) = encode_arg(value, type_id, types)
+                .map_err(|e| format!("{name}: {e}"))?;
+            coerced.push(value);
+            bytes.append(&mut arg_bytes);
+        }
+        Ok(Some(EncodedCall { args: coerced, bytes }))
+    }
+}
+
+/// Encode one arg against its runtime type, returning the submission-ready value
+/// and its SCALE bytes. Applies the one Substrate-specific coercion the friendly
+/// inputs need: a bare AccountId byte value won't encode into a `MultiAddress`,
+/// so if the direct encode fails we retry once wrapped in the `Id` variant.
+fn encode_arg(
+    value: &Value<()>,
+    type_id: u32,
+    types: &scale_info::PortableRegistry,
+) -> std::result::Result<(Value<()>, Vec<u8>), String> {
+    match encode_value(value, type_id, types) {
+        Ok(bytes) => Ok((value.clone(), bytes)),
+        Err(first) => {
+            let wrapped = Value::unnamed_variant("Id", [value.clone()]);
+            match encode_value(&wrapped, type_id, types) {
+                Ok(bytes) => Ok((wrapped, bytes)),
+                // Report the original error — clearer than the wrapped retry's.
+                Err(_) => Err(first),
+            }
+        }
     }
 }
 
@@ -198,6 +246,38 @@ mod tests {
         let bytes = encode_value(&Value::u128(1_000_000), ids[1], md.types())
             .expect("u128 encodes against the value type");
         assert!(!bytes.is_empty(), "encoded value must be non-empty");
+    }
+
+    #[test]
+    fn encode_call_coerces_accountid_and_encodes_value() {
+        let md = polkadot_metadata();
+        let cat = MetadataCallCatalog::new(&md);
+        let alice: AccountId32 = ALICE_SS58.parse().unwrap();
+        // The friendly AccountId arg arrives as bare bytes (ArgKind::AccountId).
+        let raw = vec![Value::from_bytes(alice.0), Value::u128(1_000_000)];
+        let enc = cat
+            .encode_call("Balances", "transfer_keep_alive", &raw)
+            .expect("encodes")
+            .expect("metadata catalog yields Some");
+        assert!(!enc.bytes.is_empty(), "real encoded bytes");
+        // `dest` was coerced into MultiAddress::Id(...) so it (and submission) encodes.
+        assert_eq!(
+            enc.args[0],
+            Value::unnamed_variant("Id", [Value::from_bytes(alice.0)])
+        );
+        assert_eq!(enc.args[1], Value::u128(1_000_000), "value passes through");
+    }
+
+    #[test]
+    fn encode_call_errors_on_unencodable_value() {
+        let md = polkadot_metadata();
+        let cat = MetadataCallCatalog::new(&md);
+        let raw = vec![
+            Value::unnamed_variant("Id", [Value::from_bytes([0u8; 32])]),
+            Value::string("not-a-number"), // value is u128 → must fail
+        ];
+        let err = cat.encode_call("Balances", "transfer_keep_alive", &raw);
+        assert!(err.is_err(), "string into u128 must fail: {err:?}");
     }
 
     #[test]

@@ -107,8 +107,19 @@ impl ArgSpec {
     }
 }
 
-/// A browsable view over the runtime's dispatchable calls. The real impl (T12 /
-/// metadata) wraps subxt metadata; tests inject a hand-rolled catalog.
+/// The result of validating + encoding a call's arguments against runtime
+/// metadata: the submission-ready values (possibly coerced, e.g. an AccountId
+/// wrapped in `MultiAddress::Id`) and the SCALE-encoded arg bytes for preview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncodedCall {
+    /// Submission-ready arg values, index-aligned with the call's args.
+    pub args: Vec<Value<()>>,
+    /// SCALE bytes of the encoded arguments (for the preview panel).
+    pub bytes: Vec<u8>,
+}
+
+/// A browsable view over the runtime's dispatchable calls. The metadata-backed
+/// impl wraps subxt metadata; tests inject a hand-rolled catalog.
 pub trait CallCatalog {
     /// Pallet names that expose at least one call, in display order.
     fn pallets(&self) -> Vec<String>;
@@ -116,6 +127,19 @@ pub trait CallCatalog {
     fn calls(&self, pallet: &str) -> Vec<String>;
     /// Ordered argument specs for a `pallet.call`.
     fn args(&self, pallet: &str, call: &str) -> Vec<ArgSpec>;
+    /// Validate + coerce parsed `args` for `pallet.call` against their runtime
+    /// types, returning submission-ready values and the encoded arg bytes.
+    /// `Ok(None)` means the catalog has no metadata (mock/legacy) and the caller
+    /// should keep the raw args with a cosmetic preview. `Err` is a per-arg
+    /// encode failure and blocks submission. Default: `Ok(None)`.
+    fn encode_call(
+        &self,
+        _pallet: &str,
+        _call: &str,
+        _args: &[Value<()>],
+    ) -> std::result::Result<Option<EncodedCall>, String> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,8 +367,26 @@ impl<C: CallCatalog> TxBuilder<C> {
         let call = self
             .current_call()
             .ok_or_else(|| "no call selected".to_string())?;
-        let args = self.parse_args()?;
-        let encoded_preview = format!("{}  {}", self.encoded_hex(&args), self.decoded_summary(&args));
+        let raw_args = self.parse_args()?;
+        // Metadata-backed catalogs validate + coerce args against the real types
+        // (e.g. wrapping an AccountId into `MultiAddress::Id`) and yield real
+        // encoded bytes; an encode failure here blocks submission. Catalogs
+        // without metadata return `None` and we keep the cosmetic preview.
+        let (args, encoded_preview) = match self.catalog.encode_call(&pallet, &call, &raw_args)? {
+            Some(enc) => {
+                let mut hex = String::from("0x");
+                for b in &enc.bytes {
+                    let _ = write!(hex, "{b:02x}");
+                }
+                let preview = format!("{hex}  {}", self.decoded_summary(&enc.args));
+                (enc.args, preview)
+            }
+            None => {
+                let preview =
+                    format!("{}  {}", self.encoded_hex(&raw_args), self.decoded_summary(&raw_args));
+                (raw_args, preview)
+            }
+        };
         Ok(PreparedTx {
             pallet,
             call,
@@ -741,6 +783,95 @@ mod tests {
                 _ => vec![],
             }
         }
+    }
+
+    /// A catalog whose `encode_call` always fails (mimics a metadata-backed
+    /// catalog rejecting an arg).
+    struct EncErrCatalog;
+    impl CallCatalog for EncErrCatalog {
+        fn pallets(&self) -> Vec<String> {
+            vec!["P".into()]
+        }
+        fn calls(&self, _p: &str) -> Vec<String> {
+            vec!["c".into()]
+        }
+        fn args(&self, _p: &str, _c: &str) -> Vec<ArgSpec> {
+            vec![ArgSpec::typed("x", ArgKind::U128, 0)]
+        }
+        fn encode_call(
+            &self,
+            _p: &str,
+            _c: &str,
+            _args: &[Value<()>],
+        ) -> std::result::Result<Option<EncodedCall>, String> {
+            Err("x: cannot encode".into())
+        }
+    }
+
+    /// A catalog whose `encode_call` returns coerced args + sentinel bytes.
+    struct EncOkCatalog;
+    impl CallCatalog for EncOkCatalog {
+        fn pallets(&self) -> Vec<String> {
+            vec!["P".into()]
+        }
+        fn calls(&self, _p: &str) -> Vec<String> {
+            vec!["c".into()]
+        }
+        fn args(&self, _p: &str, _c: &str) -> Vec<ArgSpec> {
+            vec![ArgSpec::typed("dest", ArgKind::AccountId, 0)]
+        }
+        fn encode_call(
+            &self,
+            _p: &str,
+            _c: &str,
+            _args: &[Value<()>],
+        ) -> std::result::Result<Option<EncodedCall>, String> {
+            Ok(Some(EncodedCall {
+                args: vec![Value::unnamed_variant("Id", [Value::u128(1)])],
+                bytes: vec![0xab, 0xcd],
+            }))
+        }
+    }
+
+    /// Type a string into any builder (generic over the catalog).
+    fn type_into<C: CallCatalog>(b: &mut TxBuilder<C>, s: &str) {
+        for c in s.chars() {
+            b.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    /// Advance a single-arg builder from Signer to a filled Args field.
+    fn fill_single_arg<C: CallCatalog>(b: &mut TxBuilder<C>, value: &str) {
+        b.on_key(key(KeyCode::Enter)); // Signer -> Pallet
+        b.on_key(key(KeyCode::Enter)); // Pallet -> Call
+        b.on_key(key(KeyCode::Enter)); // Call -> Args
+        type_into(b, value);
+    }
+
+    #[test]
+    fn submit_blocked_when_catalog_encode_fails() {
+        let mut b = TxBuilder::new(EncErrCatalog);
+        fill_single_arg(&mut b, "5");
+        assert!(
+            b.on_key(key(KeyCode::Enter)).is_none(),
+            "an encode failure must block submit"
+        );
+        assert!(b.build_prepared().is_err(), "build_prepared surfaces the encode error");
+    }
+
+    #[test]
+    fn build_prepared_uses_coerced_args_and_real_hex_preview() {
+        let mut b = TxBuilder::new(EncOkCatalog);
+        fill_single_arg(&mut b, "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY");
+        let tx = b.build_prepared().expect("prepared");
+        // The submitted args come from encode_call (coerced), not the raw parse.
+        assert_eq!(tx.args, vec![Value::unnamed_variant("Id", [Value::u128(1)])]);
+        // The preview carries the real encoded hex.
+        assert!(
+            tx.encoded_preview.contains("abcd"),
+            "real encoded hex must appear in the preview: {}",
+            tx.encoded_preview
+        );
     }
 
     fn key(code: KeyCode) -> KeyEvent {
