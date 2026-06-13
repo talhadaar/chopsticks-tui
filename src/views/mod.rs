@@ -2,7 +2,10 @@
 //! overlays. Views render from `AppState` and emit `Command`; they never call
 //! RPC directly.
 
+pub mod command_registry;
 pub mod connection;
 pub mod grid;
+pub mod hint_bar;
+pub mod palette;
 pub mod picker;
 pub mod tx_builder;

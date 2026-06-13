@@ -227,6 +227,26 @@ pub enum DevAccount {
     Ferdie,
 }
 
+/// A request to write a storage value at the tip (`dev_setStorage`). Payload is
+/// refined by P2; P0 declares the minimal shape the registry/dispatch reference.
+#[derive(Debug, Clone)]
+pub struct SetStorageReq {
+    pub pallet: String,
+    pub entry: String,
+    /// The new value as scale-value JSON (P2 decides the exact encoding).
+    pub value_json: serde_json::Value,
+}
+
+/// How a `time-travel` target is specified. Parser + remaining variants owned by
+/// P4; P0 declares enough for `Command::TimeTravel` to compile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeSpec {
+    /// A unix timestamp in milliseconds.
+    UnixMillis(u64),
+    /// A relative offset like `+6s` / `+1d` (P4 pins the grammar).
+    Relative(String),
+}
+
 /// How a transaction is signed. `Impersonate` requires the fork spawned with
 /// `--mock-signature-host`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +295,21 @@ pub enum Command {
     SubmitTx(PreparedTx),
     Reconnect,
     Quit,
+    // --- MVP-2 additions (shared-contracts freeze §3) ---
+    /// Write a storage value at the tip (P2 owns dispatch).
+    SetStorage(SetStorageReq),
+    /// Rewind / jump the chain head to a block (P4 owns dispatch).
+    SetHead(u32),
+    /// Set the chain timestamp (P4 owns dispatch).
+    TimeTravel(TimeSpec),
+    /// Switch the Chopsticks build mode (P3 owns dispatch).
+    SetBuildMode(BuildMode),
+    /// Build one block from the staged extrinsic queue (P3 owns dispatch).
+    BuildWithQueue(Vec<PreparedTx>),
+    /// Persist the current fork session (P4 owns dispatch).
+    SaveSession(String),
+    /// Restore a saved session (P4 owns dispatch).
+    LoadSession(String),
 }
 
 /// Async tasks → UI loop.
@@ -289,4 +324,29 @@ pub enum Event {
     TxResult(TxOutcome),
     Disconnected(String),
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mvp2_command_variants_exist_and_clone() {
+        // Constructing each variant proves the shape compiles and is `Clone`.
+        let cmds = vec![
+            Command::SetStorage(SetStorageReq {
+                pallet: "System".into(),
+                entry: "Account".into(),
+                value_json: serde_json::Value::Null,
+            }),
+            Command::SetHead(1030),
+            Command::TimeTravel(TimeSpec::Relative("+6s".into())),
+            Command::SetBuildMode(BuildMode::Manual),
+            Command::BuildWithQueue(vec![]),
+            Command::SaveSession("snap".into()),
+            Command::LoadSession("snap".into()),
+        ];
+        let _again = cmds.clone();
+        assert_eq!(cmds.len(), 7);
+    }
 }
