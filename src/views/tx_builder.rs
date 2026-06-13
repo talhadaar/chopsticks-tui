@@ -37,6 +37,11 @@ pub enum ArgKind {
     AccountId,
     /// Free-form text / bytes.
     Text,
+    /// An arbitrary value entered as scale-value text (e.g. `Some(1)`,
+    /// `{ id: 5 }`, `Variant(...)`), parsed via `scale_value::stringify`. Used
+    /// for call args whose type is not one of the friendly primitives above; the
+    /// concrete metadata type-id lives on the [`ArgSpec`].
+    Scale,
 }
 
 impl ArgKind {
@@ -59,6 +64,14 @@ impl ArgKind {
                 .map(|id| Value::from_bytes(id.0))
                 .map_err(|_| format!("`{trimmed}` is not a valid SS58 address")),
             ArgKind::Text => Ok(Value::string(trimmed.to_string())),
+            ArgKind::Scale => {
+                let (parsed, rest) = scale_value::stringify::from_str(trimmed);
+                let value = parsed.map_err(|e| format!("`{trimmed}` is not a valid value: {e}"))?;
+                if !rest.trim().is_empty() {
+                    return Err(format!("trailing input after value: `{}`", rest.trim()));
+                }
+                Ok(value)
+            }
         }
     }
 }
@@ -68,13 +81,28 @@ impl ArgKind {
 pub struct ArgSpec {
     pub name: String,
     pub kind: ArgKind,
+    /// The argument's runtime metadata type-id, when known (metadata-backed
+    /// catalog). `None` for catalogs without metadata; encoding then falls back
+    /// to the non-validated preview.
+    pub type_id: Option<u32>,
 }
 
 impl ArgSpec {
+    /// A spec with no known metadata type-id (legacy / mock catalogs).
     pub fn new(name: impl Into<String>, kind: ArgKind) -> Self {
         Self {
             name: name.into(),
             kind,
+            type_id: None,
+        }
+    }
+
+    /// A spec carrying the argument's runtime metadata type-id.
+    pub fn typed(name: impl Into<String>, kind: ArgKind, type_id: u32) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            type_id: Some(type_id),
         }
     }
 }
@@ -826,6 +854,27 @@ mod tests {
         assert!(b.parse_args().is_err());
         // Submit must NOT emit when args are invalid.
         assert!(b.on_key(key(KeyCode::Enter)).is_none());
+    }
+
+    #[test]
+    fn arg_kind_scale_parses_text_into_value_and_rejects_garbage() {
+        // A bare integer is valid scale-value text → an unsigned primitive.
+        let v = ArgKind::Scale
+            .parse("12345")
+            .expect("integer parses as scale-value text");
+        assert_eq!(v, Value::u128(12345));
+        // A variant expression parses too.
+        assert!(ArgKind::Scale.parse("Some(1)").is_ok(), "variant expr parses");
+        // Garbage is rejected.
+        assert!(ArgKind::Scale.parse("(((").is_err(), "garbage rejected");
+    }
+
+    #[test]
+    fn arg_spec_carries_optional_type_id() {
+        // The legacy constructor defaults to no type-id.
+        assert_eq!(ArgSpec::new("x", ArgKind::U128).type_id, None);
+        // The typed constructor records the metadata type-id.
+        assert_eq!(ArgSpec::typed("x", ArgKind::Scale, 42).type_id, Some(42));
     }
 
     #[test]
