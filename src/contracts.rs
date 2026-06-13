@@ -22,7 +22,9 @@ pub type BlockHash = H256;
 // ---------------------------------------------------------------------------
 
 /// Stable unique id for a pinned storage item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct PinnedItemId(pub u64);
 
 /// Identifies a block in the fork.
@@ -33,7 +35,7 @@ pub struct BlockRef {
 }
 
 /// A segment of a path into a decoded value (for nested-field pinning).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PathSeg {
     Field(String),
     Index(u32),
@@ -41,17 +43,30 @@ pub enum PathSeg {
 
 /// A single map/double-map/NMap key argument, pre-encoding. Must round-trip to a
 /// `scale_value::Value` for subxt's dynamic storage API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KeyArg {
     AccountId(AccountId32),
-    U(u128),
+    /// A numeric key. Serialized as a decimal string so it round-trips through
+    /// TOML, which has no `u128` (only i64); P4 sessions persist `KeyArg`.
+    U(#[serde(with = "u128_string")] u128),
     Bytes(Vec<u8>),
     Text(String),
 }
 
+/// serde adaptor: represent a `u128` as a decimal string (TOML has no u128).
+mod u128_string {
+    pub fn serialize<S: serde::Serializer>(v: &u128, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u128, D::Error> {
+        let s = <String as serde::Deserialize>::deserialize(d)?;
+        s.parse::<u128>().map_err(serde::de::Error::custom)
+    }
+}
+
 /// A user-chosen storage item to watch. Fully specifies how to fetch it and
 /// which nested path to display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PinnedItem {
     pub id: PinnedItemId,
     pub pallet: String,
@@ -87,7 +102,7 @@ pub struct BlockColumn {
 // ---------------------------------------------------------------------------
 
 /// How Chopsticks builds blocks. MVP-1 always spawns `Manual`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BuildMode {
     Manual,
     Instant,
@@ -99,7 +114,7 @@ pub enum BuildMode {
 pub struct WsEndpoint(pub String);
 
 /// How to obtain a fork: spawn a new Chopsticks process or attach to one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ForkConfig {
     Spawn {
         chain_or_path: String,
@@ -217,7 +232,7 @@ pub enum CellDiff {
 // Transactions (contracts.md §3.6) — build: T11, submit: T12
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DevAccount {
     Alice,
     Bob,
@@ -360,6 +375,52 @@ mod tests {
         ];
         let _again = cmds.clone();
         assert_eq!(cmds.len(), 7);
+    }
+
+    #[test]
+    fn pinned_item_round_trips_through_toml() {
+        let item = PinnedItem {
+            id: PinnedItemId(7),
+            pallet: "System".to_string(),
+            entry: "Account".to_string(),
+            keys: vec![KeyArg::U(42), KeyArg::Text("hi".to_string())],
+            path: vec![PathSeg::Field("data".to_string()), PathSeg::Index(0)],
+            label: "System.Account(42).data.0".to_string(),
+        };
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            item: PinnedItem,
+        }
+        let text = toml::to_string(&Wrap { item: item.clone() }).unwrap();
+        let back: Wrap = toml::from_str(&text).unwrap();
+        assert_eq!(back.item, item);
+    }
+
+    #[test]
+    fn build_mode_round_trips() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            m: BuildMode,
+        }
+        let text = toml::to_string(&Wrap { m: BuildMode::Instant }).unwrap();
+        let back: Wrap = toml::from_str(&text).unwrap();
+        assert_eq!(back.m, BuildMode::Instant);
+    }
+
+    #[test]
+    fn fork_config_round_trips_through_toml() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            fork: ForkConfig,
+        }
+        let fork = ForkConfig::Spawn {
+            chain_or_path: "polkadot".to_string(),
+            build_mode: BuildMode::Manual,
+            mock_signature_host: false,
+        };
+        let text = toml::to_string(&Wrap { fork: fork.clone() }).unwrap();
+        let back: Wrap = toml::from_str(&text).unwrap();
+        assert_eq!(back.fork, fork);
     }
 
     #[test]
