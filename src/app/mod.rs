@@ -340,6 +340,9 @@ impl AppState {
             scroll: self.row_scroll,
             column_window_start: start,
             follow: self.follow,
+            baseline_block: None,
+            baseline_state: crate::views::grid::BaselineState::Off,
+            baseline_column: None,
         }
     }
 }

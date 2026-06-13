@@ -10,6 +10,21 @@ use ratatui::widgets::{Block, Cell, Row, Table, Widget};
 
 use crate::contracts::CellDiff;
 
+/// Where the pinned baseline column sits relative to the live grid window.
+///
+/// - `Off`: no baseline pinned (vs-previous mode).
+/// - `Live`: the baseline column is present in the ring buffer.
+/// - `Pending`: a baseline number is set but no matching column is held yet
+///   (e.g. pinned a future block, or it has not streamed in).
+/// - `Evicted`: the baseline column has fallen off the front of the ring buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaselineState {
+    Off,
+    Live,
+    Pending,
+    Evicted,
+}
+
 /// Glyph shown when a cell could not be decoded.
 pub const UNDECODABLE_GLYPH: &str = "⚠ <undecodable>";
 
@@ -71,6 +86,15 @@ pub struct GridViewModel {
     pub column_window_start: usize,
     /// Whether the grid is auto-following the chain tip.
     pub follow: bool,
+    /// Baseline block number, if baseline mode is active.
+    pub baseline_block: Option<u32>,
+    /// Where the baseline column sits relative to the window (drives the badge).
+    pub baseline_state: BaselineState,
+    /// A frozen render of the baseline column's cells, anchored left when the
+    /// baseline column is not already inside the visible window. One cell per
+    /// row, index-aligned with `rows`. `None` unless `baseline_state == Live`
+    /// and the baseline column is outside the window.
+    pub baseline_column: Option<Vec<GridCell>>,
 }
 
 impl GridViewModel {
@@ -82,6 +106,9 @@ impl GridViewModel {
             scroll: 0,
             column_window_start: 0,
             follow: true,
+            baseline_block: None,
+            baseline_state: BaselineState::Off,
+            baseline_column: None,
         }
     }
 }
@@ -250,6 +277,9 @@ mod tests {
             scroll: 0,
             column_window_start: 0,
             follow: true,
+            baseline_block: None,
+            baseline_state: BaselineState::Off,
+            baseline_column: None,
         }
     }
 
@@ -353,6 +383,21 @@ mod tests {
         let paused = buffer_text(&render(&model, 80, 8));
         assert!(paused.contains("PAUSED"), "expected PAUSED badge");
         assert!(!paused.contains("FOLLOW"), "unexpected FOLLOW badge");
+    }
+
+    #[test]
+    fn baseline_state_default_is_off() {
+        let model = model_with(
+            vec![GridRow {
+                label: "row".to_string(),
+                cells: vec![GridCell::text("x")],
+            }],
+            vec![1],
+        );
+        // model_with builds a default (vs-previous) model: no baseline.
+        assert_eq!(model.baseline_block, None);
+        assert_eq!(model.baseline_state, BaselineState::Off);
+        assert!(model.baseline_column.is_none());
     }
 
     #[test]
