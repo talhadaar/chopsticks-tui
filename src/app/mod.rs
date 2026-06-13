@@ -35,6 +35,7 @@ use crate::views::connection::ConnectionView;
 use crate::views::grid::{GridCell, GridRow, GridView, GridViewModel};
 use crate::views::picker::StoragePicker;
 use crate::views::set_storage::{SetStorageEditor, ValueMode};
+use crate::views::build_panel::{BuildPanel, PanelAction};
 use crate::views::tx_builder::{ArgKind, ArgSpec, CallCatalog, TxBuilder};
 use crate::app::input::{KeyRouting, Mode, route_key};
 use crate::views::command_registry::{CommandRoute, LocalAction, parse_line, to_route};
@@ -202,6 +203,12 @@ impl AppState {
         self.follow = true;
     }
 
+    /// Set the current build mode (UI-side; the RPC switch is dispatched
+    /// separately via `Command::SetBuildMode`). MVP-2 P3.
+    pub fn set_build_mode(&mut self, mode: BuildMode) {
+        self.build_mode = mode;
+    }
+
     /// Set (or move) the baseline. `None` resolves to the newest column's block
     /// number ("pin the current tip"); if there are no columns it stays `None`.
     /// `Some(n)` pins that exact block number.
@@ -243,7 +250,8 @@ impl AppState {
             // Overlay/modal opens are performed by the loop, not by state.
             LocalAction::OpenPicker
             | LocalAction::OpenTxBuilder
-            | LocalAction::OpenSetStorage => {}
+            | LocalAction::OpenSetStorage
+            | LocalAction::OpenBuildPanel => {}
         }
     }
 
@@ -511,6 +519,7 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
     let mut picker: Option<StoragePicker<'static>> = None;
     let mut tx_builder: Option<TxBuilder<CuratedCallCatalog>> = None;
     let mut set_storage_editor: Option<SetStorageEditor<'static>> = None;
+    let mut build_panel: Option<BuildPanel> = None;
 
     loop {
         terminal.draw(|f| {
@@ -521,6 +530,7 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
                 picker.as_ref(),
                 tx_builder.as_ref(),
                 set_storage_editor.as_ref(),
+                build_panel.as_ref(),
             )
         })?;
         if app.should_quit {
@@ -537,6 +547,7 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
                         &mut picker,
                         &mut tx_builder,
                         &mut set_storage_editor,
+                        &mut build_panel,
                         client,
                         catalog,
                     );
@@ -592,6 +603,7 @@ fn handle_key(
     picker: &mut Option<StoragePicker<'static>>,
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
     set_storage_editor: &mut Option<SetStorageEditor<'static>>,
+    build_panel: &mut Option<BuildPanel>,
     client: Option<&'static SubxtChainClient>,
     catalog: Option<&'static MetadataCatalog<'static>>,
 ) {
@@ -647,12 +659,13 @@ fn handle_key(
                 picker,
                 tx_builder,
                 set_storage_editor,
+                build_panel,
                 client,
                 catalog,
             );
         }
         KeyRouting::Overlay(key) => {
-            handle_overlay_key(key, app, cmd_tx, picker, tx_builder);
+            handle_overlay_key(key, app, cmd_tx, picker, tx_builder, build_panel);
         }
     }
 }
@@ -667,6 +680,7 @@ fn handle_palette_key(
     picker: &mut Option<StoragePicker<'static>>,
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
     set_storage_editor: &mut Option<SetStorageEditor<'static>>,
+    build_panel: &mut Option<BuildPanel>,
     client: Option<&'static SubxtChainClient>,
     catalog: Option<&'static MetadataCatalog<'static>>,
 ) {
@@ -712,6 +726,10 @@ fn handle_palette_key(
                                 app.banner = Some("set-storage: not connected".into());
                             }
                         }
+                        LocalAction::OpenBuildPanel => {
+                            *build_panel = Some(BuildPanel::new());
+                            app.mode = Mode::Insert;
+                        }
                         other => app.apply_local(other),
                     }
                 }
@@ -732,6 +750,7 @@ fn handle_overlay_key(
     cmd_tx: &mpsc::UnboundedSender<Command>,
     picker: &mut Option<StoragePicker<'static>>,
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+    build_panel: &mut Option<BuildPanel>,
 ) {
     if let Some(p) = picker.as_mut() {
         if key.code == KeyCode::Esc {
@@ -748,13 +767,53 @@ fn handle_overlay_key(
         return;
     }
     if let Some(tb) = tx_builder.as_mut() {
+        // Esc closes the tx-builder. If a build panel is open, the tx-builder was
+        // opened from it (staging flow) — return to the panel; otherwise (the
+        // standalone `:tx` flow) return to the grid.
         if key.code == KeyCode::Esc {
             *tx_builder = None;
-            app.mode = Mode::Normal;
+            if build_panel.is_none() {
+                app.mode = Mode::Normal;
+            }
             return;
         }
         if let Some(cmd) = tb.on_key(key) {
+            // Submit-mode terminal action.
             let _ = cmd_tx.send(cmd);
+            return;
+        }
+        // Stage-mode: if a tx was just staged, hand it to the build panel and
+        // close the tx-builder (back to the panel).
+        if let Some(tx) = tb.take_staged() {
+            if let Some(bp) = build_panel.as_mut() {
+                bp.push(tx);
+            }
+            *tx_builder = None;
+        }
+        return;
+    }
+    if let Some(bp) = build_panel.as_mut() {
+        match bp.on_key(key) {
+            PanelAction::None => {}
+            PanelAction::AddExtrinsic => {
+                // Open the tx-builder in Stage mode on top of the panel; its
+                // completed tx is drained back into the panel above.
+                *tx_builder = Some(TxBuilder::new_staging(CuratedCallCatalog));
+            }
+            PanelAction::Build { queue, timestamp, author } => {
+                // Block metadata (timestamp/author) is display-only: the frozen
+                // BuildWithQueue(Vec<PreparedTx>) contract carries no metadata, so
+                // the dispatch helper builds with defaults. Forwarding overrides is
+                // a P0-owned contract extension (shared-contracts §3).
+                let _ = (timestamp, author);
+                let _ = cmd_tx.send(Command::BuildWithQueue(queue));
+                *build_panel = None;
+                app.mode = Mode::Normal;
+            }
+            PanelAction::Cancel => {
+                *build_panel = None;
+                app.mode = Mode::Normal;
+            }
         }
         return;
     }
@@ -837,11 +896,34 @@ fn dispatch(
                 let _ = evt_tx.send(Event::Error("set storage: not connected".into()));
             }
         }
-        // MVP-2 commands: P0 lands stub arms; owning plans replace them.
+        // MVP-2 P3: switch the Chopsticks block-build mode.
+        Command::SetBuildMode(mode) => {
+            if let Some(c) = client {
+                let rpc = c.rpc().clone();
+                let evt = evt_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dev_rpc::set_block_build_mode(&rpc, mode).await {
+                        let _ = evt.send(Event::Error(format!("set build mode: {e}")));
+                    }
+                });
+            }
+        }
+        // MVP-2 P3: build one block from the staged extrinsic queue.
+        Command::BuildWithQueue(queue) => {
+            if let Some(c) = client {
+                let inner = c.inner().clone();
+                let rpc = c.rpc().clone();
+                let evt = evt_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dev_rpc::build_with_queue(&inner, &rpc, queue).await {
+                        let _ = evt.send(Event::Error(format!("build with queue: {e}")));
+                    }
+                });
+            }
+        }
+        // Remaining MVP-2 commands: P0 lands stub arms; owning plans replace them.
         Command::SetHead(_)
         | Command::TimeTravel(_)
-        | Command::SetBuildMode(_)
-        | Command::BuildWithQueue(_)
         | Command::SaveSession(_)
         | Command::LoadSession(_) => {
             let _ = evt_tx.send(Event::Error("not yet implemented".into()));
@@ -1013,14 +1095,17 @@ fn render(
     picker: Option<&StoragePicker<'static>>,
     tx_builder: Option<&TxBuilder<CuratedCallCatalog>>,
     set_storage_editor: Option<&SetStorageEditor<'static>>,
+    build_panel: Option<&BuildPanel>,
 ) {
     let area = f.area();
     match app.phase {
         Phase::Connecting => app.connection.render(f, area),
         Phase::Grid => {
-            // banner (optional) + grid + tx-result panel + hint bar.
+            // status line (banner OR build-mode indicator) + grid + tx-result
+            // panel + hint bar. The top line is always reserved: an error banner
+            // takes priority, otherwise it shows the current build mode.
             let chunks = Layout::vertical([
-                Constraint::Length(if app.banner.is_some() { 1 } else { 0 }),
+                Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(if app.tx_result.is_some() { 4 } else { 0 }),
                 Constraint::Length(1),
@@ -1031,6 +1116,13 @@ fn render(
                 f.render_widget(
                     Paragraph::new(banner.as_str())
                         .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red)),
+                    chunks[0],
+                );
+            } else {
+                // Build-mode indicator (purple = dev surface).
+                f.render_widget(
+                    Paragraph::new(format!("build-mode: {:?}", app.build_mode))
+                        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Magenta)),
                     chunks[0],
                 );
             }
@@ -1071,6 +1163,10 @@ fn render(
                 let a = centered(area, 70, 70);
                 f.render_widget(Clear, a);
                 tb.render(f, a);
+            } else if let Some(bp) = build_panel {
+                let a = centered(area, 70, 60);
+                f.render_widget(Clear, a);
+                bp.render(f, a);
             } else if let Some(pal) = &app.palette {
                 pal.render(f, area);
             }
@@ -1371,6 +1467,15 @@ mod tests {
     }
 
     #[test]
+    fn set_build_mode_updates_state() {
+        use crate::contracts::BuildMode;
+        let mut app = AppState::new();
+        assert_eq!(app.build_mode, BuildMode::Manual); // MVP-1 default
+        app.set_build_mode(BuildMode::Instant);
+        assert_eq!(app.build_mode, BuildMode::Instant);
+    }
+
+    #[test]
     fn apply_local_open_picker_is_a_noop_on_state() {
         // P0 routes OpenPicker via the loop (opening the overlay), not apply_local;
         // baseline arms are thin until P1. apply_local must not panic on any arm.
@@ -1405,7 +1510,7 @@ mod tests {
         app.push_column(column(1, 1, 1));
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut term = ratatui::Terminal::new(backend).unwrap();
-        term.draw(|f| render(f, &app, &DefaultRenderer, None, None, None)).unwrap();
+        term.draw(|f| render(f, &app, &DefaultRenderer, None, None, None, None)).unwrap();
         let buf = term.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("NORMAL"), "hint bar mode indicator must render: {dump}");
@@ -1423,6 +1528,7 @@ mod tests {
         let mut picker = None;
         let mut txb = None;
         let mut sse = None;
+        let mut bp = None;
         handle_key(
             press_key(KeyCode::Char(':')),
             &mut app,
@@ -1430,6 +1536,7 @@ mod tests {
             &mut picker,
             &mut txb,
             &mut sse,
+            &mut bp,
             None,
             None,
         );
@@ -1445,6 +1552,7 @@ mod tests {
         let mut picker = None;
         let mut txb = None;
         let mut sse = None;
+        let mut bp = None;
         handle_key(
             press_key(KeyCode::Char(':')),
             &mut app,
@@ -1452,6 +1560,7 @@ mod tests {
             &mut picker,
             &mut txb,
             &mut sse,
+            &mut bp,
             None,
             None,
         );
@@ -1462,6 +1571,7 @@ mod tests {
             &mut picker,
             &mut txb,
             &mut sse,
+            &mut bp,
             None,
             None,
         );
@@ -1479,6 +1589,7 @@ mod tests {
         let mut picker = None;
         let mut txb = None;
         let mut sse = None;
+        let mut bp = None;
         handle_key(
             press_key(KeyCode::Char(':')),
             &mut app,
@@ -1486,6 +1597,7 @@ mod tests {
             &mut picker,
             &mut txb,
             &mut sse,
+            &mut bp,
             None,
             None,
         );

@@ -145,6 +145,16 @@ enum Focus {
     Args,
 }
 
+/// Whether the builder's terminal action submits the tx or stages it for a
+/// caller (the MVP-2 build panel) to collect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxBuilderMode {
+    /// Emit `Command::SubmitTx` (default — the `t` standalone flow).
+    Submit,
+    /// Park the `PreparedTx` for the build panel via `take_staged`.
+    Stage,
+}
+
 /// The guided transaction builder overlay.
 ///
 /// Generic over a [`CallCatalog`] so production code passes a metadata-backed
@@ -172,6 +182,11 @@ pub struct TxBuilder<C: CallCatalog> {
 
     /// Last submission outcome, once T12 delivers it.
     result: Option<TxOutcome>,
+
+    /// Terminal-action behaviour: submit vs stage (MVP-2 P3).
+    mode: TxBuilderMode,
+    /// In `Stage` mode, the most recently staged tx awaiting collection.
+    staged: Option<PreparedTx>,
 }
 
 impl<C: CallCatalog> TxBuilder<C> {
@@ -189,9 +204,24 @@ impl<C: CallCatalog> TxBuilder<C> {
             arg_inputs: Vec::new(),
             arg_field: 0,
             result: None,
+            mode: TxBuilderMode::Submit,
+            staged: None,
         };
         me.sync_arg_inputs();
         me
+    }
+
+    /// Like [`TxBuilder::new`] but the terminal action stages the tx instead of
+    /// submitting it (the build-panel `a`-flow). MVP-2 P3.
+    pub fn new_staging(catalog: C) -> Self {
+        let mut me = Self::new(catalog);
+        me.mode = TxBuilderMode::Stage;
+        me
+    }
+
+    /// Take the staged `PreparedTx`, if the user completed one in `Stage` mode.
+    pub fn take_staged(&mut self) -> Option<PreparedTx> {
+        self.staged.take()
     }
 
     // -- derived selection -------------------------------------------------
@@ -415,11 +445,19 @@ impl<C: CallCatalog> TxBuilder<C> {
         }
     }
 
-    /// Try to assemble and emit the transaction. Returns `None` (and leaves the
-    /// overlay open) if the selection is incomplete or an arg fails to parse.
+    /// Try to assemble the transaction. In `Submit` mode, returns
+    /// `Some(Command::SubmitTx)`; in `Stage` mode, parks the tx in `self.staged`
+    /// and returns `None`. Returns `None` (overlay stays open) if incomplete or
+    /// an arg fails to parse.
     fn submit(&mut self) -> Option<Command> {
         match self.build_prepared() {
-            Ok(tx) => Some(Command::SubmitTx(tx)),
+            Ok(tx) => match self.mode {
+                TxBuilderMode::Submit => Some(Command::SubmitTx(tx)),
+                TxBuilderMode::Stage => {
+                    self.staged = Some(tx);
+                    None
+                }
+            },
             Err(_) => None,
         }
     }
@@ -824,6 +862,22 @@ mod tests {
             }
             other => panic!("expected SubmitTx, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stage_mode_returns_prepared_tx_without_emitting_submit() {
+        let mut b = TxBuilder::new_staging(MockCatalog);
+        ready_to_submit(&mut b);
+        // In Stage mode the terminal action does NOT emit a Command...
+        assert!(b.on_key(key(KeyCode::Enter)).is_none());
+        // ...it parks the PreparedTx for the caller to take.
+        let staged = b.take_staged().expect("staged tx available");
+        assert_eq!(staged.pallet, "Balances");
+        assert_eq!(staged.call, "transfer_keep_alive");
+        assert_eq!(staged.args.len(), 2);
+        assert_eq!(staged.signer, TxSigner::Dev(DevAccount::Alice));
+        // Taken once, gone.
+        assert!(b.take_staged().is_none());
     }
 
     #[test]

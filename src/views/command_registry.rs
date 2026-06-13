@@ -158,6 +158,8 @@ pub enum LocalAction {
     OpenSetStorage,
     /// Open the transaction builder (`:tx`).
     OpenTxBuilder,
+    /// Open the build staging panel (`:build`). P3 fills the UI.
+    OpenBuildPanel,
     /// Open the sessions modal (`:sessions`). P4 fills the UI.
     OpenSessions,
 }
@@ -234,7 +236,9 @@ pub fn to_route(parsed: &ParsedCommand) -> std::result::Result<CommandRoute, Par
             let n = parse_block("block", arg(0).ok_or(ParseError::MissingArg("block"))?)?;
             CommandRoute::Dispatch(Command::SetHead(n))
         }
-        "build" => CommandRoute::Dispatch(Command::BuildWithQueue(vec![])),
+        // `:build` opens the staging panel (P3); the panel's ↵ emits the actual
+        // `Command::BuildWithQueue`. (Previously a direct empty-queue dispatch.)
+        "build" => CommandRoute::Local(LocalAction::OpenBuildPanel),
         "build-mode" => {
             let raw = arg(0).ok_or(ParseError::MissingArg("mode"))?;
             let mode = match raw.to_ascii_lowercase().as_str() {
