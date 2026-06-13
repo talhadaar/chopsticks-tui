@@ -1016,4 +1016,18 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.palette.is_none());
     }
+
+    #[test]
+    fn connecting_phase_routes_to_connection_not_palette() {
+        // MVP-1 guarantee: in Connecting, `:` must NOT open the palette; it goes
+        // to the connection form (which treats it as input).
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let mut app = AppState::new();
+        assert_eq!(app.phase, Phase::Connecting);
+        let mut picker = None;
+        let mut txb = None;
+        handle_key(press_key(KeyCode::Char(':')), &mut app, &tx, &mut picker, &mut txb, None);
+        assert!(app.palette.is_none(), "palette must not open while connecting");
+        assert_eq!(app.mode, Mode::Normal, "mode unchanged while connecting");
+    }
 }
