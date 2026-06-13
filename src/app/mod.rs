@@ -201,6 +201,12 @@ impl AppState {
         self.follow = true;
     }
 
+    /// Set the current build mode (UI-side; the RPC switch is dispatched
+    /// separately via `Command::SetBuildMode`). MVP-2 P3.
+    pub fn set_build_mode(&mut self, mode: BuildMode) {
+        self.build_mode = mode;
+    }
+
     /// Set (or move) the baseline. `None` resolves to the newest column's block
     /// number ("pin the current tip"); if there are no columns it stays `None`.
     /// `Some(n)` pins that exact block number.
@@ -1191,6 +1197,15 @@ mod tests {
         assert_eq!(app.build_mode, crate::contracts::BuildMode::Manual);
         assert!(app.action_log.is_empty());
         assert!(app.loaded_session.is_none());
+    }
+
+    #[test]
+    fn set_build_mode_updates_state() {
+        use crate::contracts::BuildMode;
+        let mut app = AppState::new();
+        assert_eq!(app.build_mode, BuildMode::Manual); // MVP-1 default
+        app.set_build_mode(BuildMode::Instant);
+        assert_eq!(app.build_mode, BuildMode::Instant);
     }
 
     #[test]
