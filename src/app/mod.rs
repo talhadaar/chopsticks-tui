@@ -406,17 +406,13 @@ impl AppState {
             // P1: baseline mutation, applied directly to state (no RPC).
             LocalAction::SetBaseline(block) => self.set_baseline(block),
             LocalAction::ClearBaseline => self.clear_baseline(),
-            // Deferred to later MVP-2 phases: surface feedback instead of a silent
-            // no-op, matching the RPC stubs' "not yet implemented". P4 wires up
-            // sessions.
-            LocalAction::OpenSessions => {
-                self.banner = Some("not yet implemented".into());
-            }
-            // Overlay/modal opens are performed by the loop, not by state.
+            // Overlay/modal opens are performed by the loop, not by state (P4
+            // wires the sessions modal open at the loop site, like the others).
             LocalAction::OpenPicker
             | LocalAction::OpenTxBuilder
             | LocalAction::OpenSetStorage
-            | LocalAction::OpenBuildPanel => {}
+            | LocalAction::OpenBuildPanel
+            | LocalAction::OpenSessions => {}
         }
     }
 
@@ -685,6 +681,7 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
     let mut tx_builder: Option<TxBuilder<CuratedCallCatalog>> = None;
     let mut set_storage_editor: Option<SetStorageEditor<'static>> = None;
     let mut build_panel: Option<BuildPanel> = None;
+    let mut sessions: Option<crate::views::sessions::SessionsView> = None;
 
     loop {
         terminal.draw(|f| {
@@ -696,6 +693,7 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
                 tx_builder.as_ref(),
                 set_storage_editor.as_ref(),
                 build_panel.as_ref(),
+                sessions.as_ref(),
             )
         })?;
         if app.should_quit {
@@ -713,6 +711,7 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
                         &mut tx_builder,
                         &mut set_storage_editor,
                         &mut build_panel,
+                        &mut sessions,
                         client,
                         catalog,
                     );
@@ -787,6 +786,7 @@ fn handle_key(
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
     set_storage_editor: &mut Option<SetStorageEditor<'static>>,
     build_panel: &mut Option<BuildPanel>,
+    sessions: &mut Option<crate::views::sessions::SessionsView>,
     client: Option<&'static SubxtChainClient>,
     catalog: Option<&'static MetadataCatalog<'static>>,
 ) {
@@ -818,6 +818,13 @@ fn handle_key(
         return;
     }
 
+    // Sessions modal open: route to it ahead of grid/palette (spec §8). It emits
+    // a `SessionsAction` the loop turns into IO + Commands; the loop owns IO.
+    if sessions.is_some() {
+        route_sessions_key(key, app, cmd_tx, sessions);
+        return;
+    }
+
     match route_key(app.mode, key) {
         KeyRouting::OpenPalette => {
             app.palette = Some(CommandPalette::new());
@@ -834,6 +841,12 @@ fn handle_key(
             app.mode = Mode::Insert;
         }
         KeyRouting::Grid(key) => {
+            // `S` opens the sessions modal (standalone fallback before/besides the
+            // `:sessions` palette verb; mirrors how `p`/`t` open overlays directly).
+            if key.code == KeyCode::Char('S') {
+                open_sessions(app, sessions);
+                return;
+            }
             for cmd in app.on_key(key) {
                 let _ = cmd_tx.send(cmd);
             }
@@ -847,6 +860,7 @@ fn handle_key(
                 tx_builder,
                 set_storage_editor,
                 build_panel,
+                sessions,
                 client,
                 catalog,
             );
@@ -868,6 +882,7 @@ fn handle_palette_key(
     tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
     set_storage_editor: &mut Option<SetStorageEditor<'static>>,
     build_panel: &mut Option<BuildPanel>,
+    sessions: &mut Option<crate::views::sessions::SessionsView>,
     client: Option<&'static SubxtChainClient>,
     catalog: Option<&'static MetadataCatalog<'static>>,
 ) {
@@ -917,6 +932,7 @@ fn handle_palette_key(
                             *build_panel = Some(BuildPanel::new());
                             app.mode = Mode::Insert;
                         }
+                        LocalAction::OpenSessions => open_sessions(app, sessions),
                         other => app.apply_local(other),
                     }
                 }
@@ -1006,6 +1022,71 @@ fn handle_overlay_key(
     }
     // No overlay actually open (mode drift): snap back to Normal.
     app.mode = Mode::Normal;
+}
+
+/// Open the sessions modal over the current on-disk session list (P4). A read
+/// failure is non-fatal: open with an empty list and surface a banner.
+fn open_sessions(
+    app: &mut AppState,
+    sessions: &mut Option<crate::views::sessions::SessionsView>,
+) {
+    let list = match crate::session::list_sessions() {
+        Ok(l) => l,
+        Err(e) => {
+            app.banner = Some(format!("sessions: {e}"));
+            Vec::new()
+        }
+    };
+    *sessions = Some(crate::views::sessions::SessionsView::new(list));
+    app.mode = Mode::Insert;
+}
+
+/// Feed a key to the open sessions modal and act on its `SessionsAction` (P4).
+/// Restore/Save dispatch `Command`s the loop applies via `on_command_local`;
+/// Delete/Rename perform IO here and reopen the refreshed list.
+fn route_sessions_key(
+    key: KeyEvent,
+    app: &mut AppState,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
+    sessions: &mut Option<crate::views::sessions::SessionsView>,
+) {
+    use crate::views::sessions::SessionsAction;
+    let Some(sv) = sessions.as_mut() else { return };
+    match sv.on_key(key) {
+        Some(SessionsAction::Close) => {
+            *sessions = None;
+            app.mode = Mode::Normal;
+        }
+        Some(SessionsAction::Restore(name)) => {
+            let _ = cmd_tx.send(Command::LoadSession(name));
+            *sessions = None;
+            app.mode = Mode::Normal;
+        }
+        Some(SessionsAction::SaveCurrent) => {
+            // Derive a default name from the current head; the loop persists it.
+            let head = app.columns.back().map(|c| c.block.number).unwrap_or(0);
+            let _ = cmd_tx.send(Command::SaveSession(format!("session-#{head}")));
+            *sessions = None;
+            app.mode = Mode::Normal;
+        }
+        Some(SessionsAction::Delete(name)) => {
+            if let Err(e) = crate::session::delete_session(&name) {
+                app.banner = Some(format!("delete failed: {e}"));
+            }
+            open_sessions(app, sessions); // reopen with the refreshed list
+        }
+        Some(SessionsAction::Rename { from, to }) => {
+            // Rename = load, re-save under the new name, delete the old file.
+            if let Ok(mut s) = crate::session::load_session(&from) {
+                s.name = to.clone();
+                if crate::session::save_session(&s).is_ok() {
+                    let _ = crate::session::delete_session(&from);
+                }
+            }
+            open_sessions(app, sessions);
+        }
+        None => {}
+    }
 }
 
 /// Act on a UI command: spawn the matching background task.
@@ -1309,6 +1390,7 @@ fn spawn_fetch_column(
 // Rendering
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn render(
     f: &mut Frame,
     app: &AppState,
@@ -1317,6 +1399,7 @@ fn render(
     tx_builder: Option<&TxBuilder<CuratedCallCatalog>>,
     set_storage_editor: Option<&SetStorageEditor<'static>>,
     build_panel: Option<&BuildPanel>,
+    sessions: Option<&crate::views::sessions::SessionsView>,
 ) {
     let area = f.area();
     match app.phase {
@@ -1337,6 +1420,13 @@ fn render(
                 f.render_widget(
                     Paragraph::new(banner.as_str())
                         .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red)),
+                    chunks[0],
+                );
+            } else if let Some(n) = app.off_timeline_from {
+                // Amber off-timeline badge after a set-head rewind (spec §7.1).
+                f.render_widget(
+                    Paragraph::new(format!("⏳ off-timeline from #{n}"))
+                        .style(ratatui::style::Style::default().fg(ratatui::style::Color::Yellow)),
                     chunks[0],
                 );
             } else {
@@ -1372,7 +1462,12 @@ fn render(
             render_hint_bar(f, chunks[3], app.mode);
 
             // Overlays draw on top in a centered area; the palette anchors itself.
-            if let Some(ed) = set_storage_editor {
+            // The sessions modal takes precedence when open (spec §8).
+            if let Some(sv) = sessions {
+                let a = centered(area, 70, 70);
+                f.render_widget(Clear, a);
+                sv.render(f, a);
+            } else if let Some(ed) = set_storage_editor {
                 let a = centered(area, 70, 70);
                 f.render_widget(Clear, a);
                 ed.render(f, a);
@@ -1657,6 +1752,25 @@ mod tests {
     }
 
     #[test]
+    fn off_timeline_badge_renders_in_grid() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = AppState::new();
+        app.phase = Phase::Grid;
+        app.pinned.push(item(1, "row"));
+        app.push_column(column(1030, 1, 1));
+        app.off_timeline_from = Some(1030);
+
+        let backend = TestBackend::new(80, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let renderer = DefaultRenderer;
+        term.draw(|f| render(f, &app, &renderer, None, None, None, None, None)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("from #1030"), "off-timeline badge must render: {text}");
+    }
+
+    #[test]
     fn tx_result_populates_panel_without_touching_grid() {
         let mut app = AppState::new();
         app.phase = Phase::Grid;
@@ -1889,7 +2003,7 @@ mod tests {
         app.push_column(column(1, 1, 1));
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut term = ratatui::Terminal::new(backend).unwrap();
-        term.draw(|f| render(f, &app, &DefaultRenderer, None, None, None, None)).unwrap();
+        term.draw(|f| render(f, &app, &DefaultRenderer, None, None, None, None, None)).unwrap();
         let buf = term.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("NORMAL"), "hint bar mode indicator must render: {dump}");
@@ -1908,6 +2022,7 @@ mod tests {
         let mut txb = None;
         let mut sse = None;
         let mut bp = None;
+        let mut sess = None;
         handle_key(
             press_key(KeyCode::Char(':')),
             &mut app,
@@ -1916,6 +2031,7 @@ mod tests {
             &mut txb,
             &mut sse,
             &mut bp,
+            &mut sess,
             None,
             None,
         );
@@ -1932,6 +2048,7 @@ mod tests {
         let mut txb = None;
         let mut sse = None;
         let mut bp = None;
+        let mut sess = None;
         handle_key(
             press_key(KeyCode::Char(':')),
             &mut app,
@@ -1940,6 +2057,7 @@ mod tests {
             &mut txb,
             &mut sse,
             &mut bp,
+            &mut sess,
             None,
             None,
         );
@@ -1951,6 +2069,7 @@ mod tests {
             &mut txb,
             &mut sse,
             &mut bp,
+            &mut sess,
             None,
             None,
         );
@@ -1969,6 +2088,7 @@ mod tests {
         let mut txb = None;
         let mut sse = None;
         let mut bp = None;
+        let mut sess = None;
         handle_key(
             press_key(KeyCode::Char(':')),
             &mut app,
@@ -1977,6 +2097,7 @@ mod tests {
             &mut txb,
             &mut sse,
             &mut bp,
+            &mut sess,
             None,
             None,
         );
