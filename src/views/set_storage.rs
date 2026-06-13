@@ -27,7 +27,10 @@ use crate::views::picker::StoragePicker;
 /// Which value-editing mode the value stage is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueMode {
-    /// scale-value text expression (default for free-text).
+    /// Typed field-tree: edit decoded leaves (default when a current value is
+    /// seeded). Cycles to `ScaleText` on `x`.
+    Tree,
+    /// scale-value text expression (free-text).
     ScaleText,
     /// raw `0x` SCALE hex.
     RawHex,
@@ -55,6 +58,12 @@ type KeyResolver<'a> =
 type TextEncoder<'a> =
     dyn Fn(ValueMode, &str, u32) -> std::result::Result<String, String> + 'a;
 
+/// Encodes a fully-edited decoded value (typed-tree mode) against its type-id
+/// into `0x`-hex. The app wires this with the live metadata registry; the
+/// default errors (tree mode needs metadata).
+type TreeEncoder<'a> =
+    dyn Fn(&Value<u32>, u32) -> std::result::Result<String, String> + 'a;
+
 /// The set-storage editor overlay: a target stage (embedded [`StoragePicker`])
 /// followed by a value stage that produces a [`Command::SetStorage`].
 pub struct SetStorageEditor<'a> {
@@ -73,8 +82,19 @@ pub struct SetStorageEditor<'a> {
     /// Last error to surface inline (parse/encode/key-resolve).
     error: Option<String>,
 
+    /// Typed-tree state: the working decoded value, its flattened leaves, and the
+    /// focused leaf. Empty/`None` until `with_current_value` seeds them.
+    tree_value: Option<Value<u32>>,
+    leaves: Vec<Leaf>,
+    leaf_cursor: usize,
+    /// Edit buffer for the focused leaf (Tree mode).
+    leaf_input: String,
+    /// Whether the focused leaf is being edited (vs. just navigated).
+    editing_leaf: bool,
+
     resolve_key: Box<KeyResolver<'a>>,
     encode_text: Box<TextEncoder<'a>>,
+    encode_tree: Box<TreeEncoder<'a>>,
 }
 
 impl<'a> SetStorageEditor<'a> {
@@ -96,12 +116,18 @@ impl<'a> SetStorageEditor<'a> {
             mode: ValueMode::ScaleText,
             input: String::new(),
             error: None,
+            tree_value: None,
+            leaves: Vec::new(),
+            leaf_cursor: 0,
+            leaf_input: String::new(),
+            editing_leaf: false,
             resolve_key: Box::new(resolve_key),
             encode_text: Box::new(|mode, raw, _ty| match mode {
                 ValueMode::RawHex => encode_raw_hex(raw),
-                ValueMode::ScaleText => {
-                    Err("scale-value text needs metadata (press `x` for raw hex)".to_string())
-                }
+                _ => Err("scale-value text needs metadata (press `x` for raw hex)".to_string()),
+            }),
+            encode_tree: Box::new(|_v, _ty| {
+                Err("typed-tree encoding needs metadata".to_string())
             }),
         }
     }
@@ -115,6 +141,29 @@ impl<'a> SetStorageEditor<'a> {
         encode_text: impl Fn(ValueMode, &str, u32) -> std::result::Result<String, String> + 'a,
     ) -> Self {
         self.encode_text = Box::new(encode_text);
+        self
+    }
+
+    /// Override the typed-tree encoder with one that has the live metadata
+    /// registry (the app supplies this). Receives the edited decoded value + the
+    /// value type-id and returns `0x`-hex.
+    pub fn with_tree_encoder(
+        mut self,
+        encode_tree: impl Fn(&Value<u32>, u32) -> std::result::Result<String, String> + 'a,
+    ) -> Self {
+        self.encode_tree = Box::new(encode_tree);
+        self
+    }
+
+    /// Seed the typed-tree mode with the target's current decoded value. When
+    /// `None`, the editor stays in free-text mode (e.g. the key doesn't exist
+    /// yet — spec §5 "keys that don't exist yet").
+    pub fn with_current_value(mut self, value: Option<Value<u32>>) -> Self {
+        if let Some(v) = value {
+            self.leaves = flatten_leaves(&v);
+            self.tree_value = Some(v);
+            self.mode = ValueMode::Tree;
+        }
         self
     }
 
@@ -154,13 +203,14 @@ impl<'a> SetStorageEditor<'a> {
     }
 
     fn on_key_value(&mut self, key: KeyEvent) -> Option<Command> {
+        if self.mode == ValueMode::Tree {
+            return self.on_key_tree(key);
+        }
         match key.code {
-            // `x` toggles raw-hex / scale-text while the buffer is empty.
+            // `x` cycles raw-hex / scale-text while the buffer is empty. If a
+            // tree value was seeded, `x` can also return to Tree mode.
             KeyCode::Char('x') if self.input.is_empty() => {
-                self.mode = match self.mode {
-                    ValueMode::ScaleText => ValueMode::RawHex,
-                    ValueMode::RawHex => ValueMode::ScaleText,
-                };
+                self.cycle_mode();
                 self.error = None;
                 None
             }
@@ -172,19 +222,131 @@ impl<'a> SetStorageEditor<'a> {
                 self.input.pop();
                 None
             }
-            KeyCode::Enter => self.confirm(),
+            KeyCode::Enter => self.confirm_freetext(),
             _ => None,
         }
     }
 
-    /// Encode the current input and emit `SetStorage`, or stash an error.
-    fn confirm(&mut self) -> Option<Command> {
+    /// Key handling in typed-tree mode: `j`/`k` move the leaf cursor, `Enter`
+    /// begins/commits an edit of the focused leaf, `x` drops to free-text.
+    fn on_key_tree(&mut self, key: KeyEvent) -> Option<Command> {
+        if self.editing_leaf {
+            match key.code {
+                KeyCode::Char(c) => self.leaf_input.push(c),
+                KeyCode::Backspace => {
+                    self.leaf_input.pop();
+                }
+                KeyCode::Esc => {
+                    self.editing_leaf = false;
+                    self.leaf_input.clear();
+                }
+                KeyCode::Enter => self.commit_leaf_edit(),
+                _ => {}
+            }
+            return None;
+        }
+        match key.code {
+            KeyCode::Char('x') => {
+                self.mode = ValueMode::ScaleText;
+                self.error = None;
+                None
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.leaves.is_empty() {
+                    self.leaf_cursor = (self.leaf_cursor + 1).min(self.leaves.len() - 1);
+                }
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.leaf_cursor = self.leaf_cursor.saturating_sub(1);
+                None
+            }
+            // Begin editing the focused leaf.
+            KeyCode::Char('i') => {
+                if let Some(leaf) = self.leaves.get(self.leaf_cursor) {
+                    self.leaf_input = leaf.text.clone();
+                    self.editing_leaf = true;
+                }
+                None
+            }
+            // Confirm the whole edited tree → SetStorage.
+            KeyCode::Enter => self.confirm_tree(),
+            _ => None,
+        }
+    }
+
+    /// Parse the leaf edit buffer and write it back into the working tree.
+    fn commit_leaf_edit(&mut self) {
+        let Some(leaf) = self.leaves.get(self.leaf_cursor).cloned() else {
+            self.editing_leaf = false;
+            return;
+        };
+        let (parsed, rest) = scale_value::stringify::from_str(&self.leaf_input);
+        let new = match parsed {
+            Ok(v) if rest.trim().is_empty() => v.map_context(|_| 0u32),
+            Ok(_) => {
+                self.error = Some(format!("trailing input: {rest:?}"));
+                return;
+            }
+            Err(e) => {
+                self.error = Some(format!("parse leaf: {e:?}"));
+                return;
+            }
+        };
+        if let Some(tree) = self.tree_value.as_mut() {
+            if let Err(e) = set_leaf(tree, &leaf.path, new) {
+                self.error = Some(e);
+                return;
+            }
+            // Refresh leaves so the display reflects the edit.
+            self.leaves = flatten_leaves(tree);
+            self.error = None;
+        }
+        self.editing_leaf = false;
+        self.leaf_input.clear();
+    }
+
+    /// Cycle free-text modes; if a tree value is seeded, include Tree in the cycle.
+    fn cycle_mode(&mut self) {
+        self.mode = match self.mode {
+            ValueMode::ScaleText => ValueMode::RawHex,
+            ValueMode::RawHex if self.tree_value.is_some() => ValueMode::Tree,
+            ValueMode::RawHex => ValueMode::ScaleText,
+            ValueMode::Tree => ValueMode::ScaleText,
+        };
+    }
+
+    /// Encode the free-text input and emit `SetStorage`, or stash an error.
+    fn confirm_freetext(&mut self) -> Option<Command> {
         let key_hex = self.key_hex.clone()?;
         let target = self.target.clone()?;
         let type_id = self.value_type_id.unwrap_or(0);
         match (self.encode_text)(self.mode, &self.input, type_id) {
             Ok(value_hex) => {
                 let label = format!("{} = {}", target.label, self.input.trim());
+                self.error = None;
+                Some(Command::SetStorage(SetStorageReq {
+                    key_hex,
+                    value_hex: Some(value_hex),
+                    label,
+                }))
+            }
+            Err(e) => {
+                self.error = Some(e);
+                None
+            }
+        }
+    }
+
+    /// Re-encode the edited tree value and emit `SetStorage`, or stash an error.
+    fn confirm_tree(&mut self) -> Option<Command> {
+        let key_hex = self.key_hex.clone()?;
+        let target = self.target.clone()?;
+        let type_id = self.value_type_id.unwrap_or(0);
+        let tree = self.tree_value.as_ref()?;
+        match (self.encode_tree)(tree, type_id) {
+            Ok(value_hex) => {
+                let label = format!("{} (edited)", target.label);
                 self.error = None;
                 Some(Command::SetStorage(SetStorageReq {
                     key_hex,
@@ -229,29 +391,56 @@ impl<'a> SetStorageEditor<'a> {
         );
 
         let mode_label = match self.mode {
+            ValueMode::Tree => "typed field-tree",
             ValueMode::ScaleText => "scale-value text",
             ValueMode::RawHex => "raw SCALE hex",
         };
-        let editor = Paragraph::new(Text::from(vec![
-            Line::from(format!("[{mode_label}]")),
-            Line::from(self.input.as_str()),
-        ]))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Value")
-                // purple = dev/command surface (spec §2.3).
-                .border_style(Style::default().fg(Color::Magenta)),
-        );
+
+        let body = if self.mode == ValueMode::Tree {
+            let mut lines = vec![Line::from(format!("[{mode_label}]"))];
+            for (i, leaf) in self.leaves.iter().enumerate() {
+                let focused = i == self.leaf_cursor;
+                let value = if focused && self.editing_leaf {
+                    format!("{} → {}", leaf.text, self.leaf_input)
+                } else {
+                    leaf.text.clone()
+                };
+                let marker = if focused { "›" } else { " " };
+                let line = format!("{marker} {} = {}", leaf.display_path, value);
+                let style = if focused {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(line, style));
+            }
+            Text::from(lines)
+        } else {
+            Text::from(vec![
+                Line::from(format!("[{mode_label}]")),
+                Line::from(self.input.as_str()),
+            ])
+        };
+
+        let editor = Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Value")
+                    // purple = dev/command surface (spec §2.3).
+                    .border_style(Style::default().fg(Color::Magenta)),
+            );
         frame.render_widget(editor, rows[1]);
 
+        let hint_text = match self.mode {
+            ValueMode::Tree if self.editing_leaf => "type value · ↵ commit · esc cancel edit",
+            ValueMode::Tree => "j/k move · i edit · ↵ write at tip · x free-text · esc cancel",
+            _ => "x toggle mode · ↵ write at tip · esc cancel",
+        };
         let hint = match &self.error {
             Some(e) => Span::styled(format!("error: {e}"), Style::default().fg(Color::Red)),
-            None => Span::styled(
-                "x toggle hex/text · ↵ write at tip · esc cancel",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
+            None => Span::styled(hint_text, Style::default().add_modifier(Modifier::DIM)),
         };
         frame.render_widget(Paragraph::new(Line::from(hint)), rows[2]);
     }
@@ -315,6 +504,117 @@ where
     encode_as_type(value, type_id, registry, &mut buf)
         .map_err(|e| format!("encode error: {e}"))?;
     Ok(to_hex(&buf))
+}
+
+// ---------------------------------------------------------------------------
+// Typed field-tree core (Task 7): decode → flat editable leaves → re-encode.
+// ---------------------------------------------------------------------------
+
+use scale_value::{Composite, Primitive, ValueDef};
+
+/// A path segment into a decoded value (local to the tree editor; mirrors
+/// `contracts::PathSeg` but kept local to avoid a cross-module dep).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seg {
+    Field(String),
+    Index(usize),
+}
+
+/// One editable leaf of the decoded value.
+#[derive(Debug, Clone)]
+pub struct Leaf {
+    /// Path from the root to this leaf.
+    pub path: Vec<Seg>,
+    /// Dotted display path, e.g. `data.free`.
+    pub display_path: String,
+    /// Current rendered text of the leaf (what the user edits).
+    pub text: String,
+}
+
+/// Flatten a decoded value into its primitive leaves, depth-first. Composites
+/// recurse; primitives/variants/bit-sequences are leaves (a variant is edited
+/// via free-text, per the fallback).
+pub fn flatten_leaves(value: &Value<u32>) -> Vec<Leaf> {
+    let mut out = Vec::new();
+    walk(value, &mut Vec::new(), &mut out);
+    out
+}
+
+fn walk(value: &Value<u32>, path: &mut Vec<Seg>, out: &mut Vec<Leaf>) {
+    match &value.value {
+        ValueDef::Composite(Composite::Named(fields)) => {
+            for (name, v) in fields {
+                path.push(Seg::Field(name.clone()));
+                walk(v, path, out);
+                path.pop();
+            }
+        }
+        ValueDef::Composite(Composite::Unnamed(vals)) => {
+            for (i, v) in vals.iter().enumerate() {
+                path.push(Seg::Index(i));
+                walk(v, path, out);
+                path.pop();
+            }
+        }
+        // Primitives, variants, bit-sequences are leaves.
+        _ => out.push(Leaf {
+            path: path.clone(),
+            display_path: display_path(path),
+            text: leaf_text(value),
+        }),
+    }
+}
+
+fn display_path(path: &[Seg]) -> String {
+    if path.is_empty() {
+        return "(value)".to_string();
+    }
+    path.iter()
+        .map(|s| match s {
+            Seg::Field(n) => n.clone(),
+            Seg::Index(i) => i.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// One-line text for a leaf value (numbers, bools, strings; everything else hex).
+fn leaf_text(value: &Value<u32>) -> String {
+    match &value.value {
+        ValueDef::Primitive(Primitive::U128(n)) => n.to_string(),
+        ValueDef::Primitive(Primitive::I128(n)) => n.to_string(),
+        ValueDef::Primitive(Primitive::Bool(b)) => b.to_string(),
+        ValueDef::Primitive(Primitive::String(s)) => s.clone(),
+        ValueDef::Primitive(Primitive::Char(c)) => c.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Replace the value at `path` with `new`. Errors if the path does not resolve.
+pub fn set_leaf(
+    value: &mut Value<u32>,
+    path: &[Seg],
+    new: Value<u32>,
+) -> std::result::Result<(), String> {
+    let Some((head, rest)) = path.split_first() else {
+        *value = new;
+        return Ok(());
+    };
+    match (&mut value.value, head) {
+        (ValueDef::Composite(Composite::Named(fields)), Seg::Field(name)) => {
+            let slot = fields
+                .iter_mut()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v)
+                .ok_or_else(|| format!("no field {name}"))?;
+            set_leaf(slot, rest, new)
+        }
+        (ValueDef::Composite(Composite::Unnamed(vals)), Seg::Index(i)) => {
+            let slot = vals.get_mut(*i).ok_or_else(|| format!("no index {i}"))?;
+            set_leaf(slot, rest, new)
+        }
+        _ => Err("path does not resolve to a composite".to_string()),
+    }
 }
 
 /// Lowercase `0x`-prefixed hex (mirrors `dev_rpc::to_hex` / `storage_fetch::hex_of`).
@@ -450,5 +750,53 @@ mod tests {
             }
             other => panic!("expected SetStorage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn flattens_named_struct_into_leaf_paths() {
+        // AccountInfo-ish: { nonce: 3, data: { free: 100, reserved: 0 } }
+        let v: Value<u32> = Value::named_composite([
+            ("nonce", Value::u128(3)),
+            (
+                "data",
+                Value::named_composite([
+                    ("free", Value::u128(100)),
+                    ("reserved", Value::u128(0)),
+                ]),
+            ),
+        ])
+        .map_context(|_| 0u32);
+        let leaves = flatten_leaves(&v);
+        let paths: Vec<String> = leaves.iter().map(|l| l.display_path.clone()).collect();
+        assert_eq!(paths, vec!["nonce", "data.free", "data.reserved"]);
+        assert_eq!(leaves[1].text, "100");
+    }
+
+    #[test]
+    fn writes_leaf_back_by_path() {
+        let mut v: Value<u32> = Value::named_composite([
+            ("free", Value::u128(1)),
+            ("reserved", Value::u128(2)),
+        ])
+        .map_context(|_| 0u32);
+        set_leaf(
+            &mut v,
+            &[Seg::Field("free".into())],
+            Value::u128(999).map_context(|_| 0u32),
+        )
+        .expect("write");
+        let leaves = flatten_leaves(&v);
+        assert_eq!(leaves[0].text, "999");
+    }
+
+    #[test]
+    fn tree_edit_reencodes_changed_value() {
+        let (registry, ty) = registry_for::<u128>();
+        let original: Value<u32> = Value::u128(100).map_context(|_| 0u32);
+        let before = encode_value(&original, ty, &registry).unwrap();
+        let mut edited = original.clone();
+        set_leaf(&mut edited, &[], Value::u128(999).map_context(|_| 0u32)).unwrap();
+        let after = encode_value(&edited, ty, &registry).unwrap();
+        assert_ne!(before, after, "edited value must re-encode differently");
     }
 }
