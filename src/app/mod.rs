@@ -1121,6 +1121,48 @@ mod tests {
     }
 
     #[test]
+    fn dod_baseline_keeps_change_lit_across_span_vs_previous_goes_gray() {
+        // A value changes once at #11, then holds steady for many blocks.
+        let mut app = AppState::new();
+        app.pinned.push(item(1, "row"));
+        app.push_column(column(10, 1, 100)); // baseline value
+        app.push_column(column(11, 1, 200)); // the change
+        for n in 12..=20 {
+            app.push_column(column(n, 1, 200)); // steady, ≠ baseline, == predecessor
+        }
+
+        // vs-previous (MVP-1 default): only #11 flashes; later columns are gray
+        // (Unchanged) because each equals its predecessor.
+        app.clear_baseline();
+        let prev_model = app.grid_view_model(&DefaultRenderer);
+        let cells = &prev_model.rows[0].cells;
+        // The newest visible column (#20) equals its predecessor → Unchanged.
+        assert_eq!(
+            cells.last().unwrap().diff,
+            CellDiff::Unchanged,
+            "vs-previous: a long-steady value must be gray"
+        );
+
+        // vs-baseline #10: every column from #11 on still differs from the
+        // frozen baseline, so the highlight STAYS LIT across the whole span.
+        app.set_baseline(Some(10));
+        let base_model = app.grid_view_model(&DefaultRenderer);
+        let cells = &base_model.rows[0].cells;
+        assert!(
+            cells
+                .iter()
+                .all(|c| matches!(c.diff, CellDiff::Changed { .. } | CellDiff::Unchanged)),
+            "baseline diffs are only Changed (≠ baseline) or Unchanged (== baseline)"
+        );
+        // The newest visible column still differs from the baseline → Changed,
+        // unlike vs-previous mode where it was gray.
+        assert!(
+            matches!(cells.last().unwrap().diff, CellDiff::Changed { .. }),
+            "baseline: a value that changed once stays lit across the span"
+        );
+    }
+
+    #[test]
     fn tx_result_populates_panel_without_touching_grid() {
         let mut app = AppState::new();
         app.phase = Phase::Grid;
