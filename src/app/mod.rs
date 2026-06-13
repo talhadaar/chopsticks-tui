@@ -225,15 +225,18 @@ impl AppState {
     }
 
     /// Apply a client-side action routed from the palette. P0 owns the seam;
-    /// the baseline arms are thin until P1 fills the diff logic. The overlay-
-    /// opening arms are handled by the app loop (which owns the overlays), so
-    /// they are no-ops on state here.
+    /// P1 fills the baseline arms with real mutation. The overlay-opening arms
+    /// are handled by the app loop (which owns the overlays), so they are
+    /// no-ops on state here.
     pub fn apply_local(&mut self, action: LocalAction) {
         match action {
+            // P1: baseline mutation, applied directly to state (no RPC).
+            LocalAction::SetBaseline(block) => self.set_baseline(block),
+            LocalAction::ClearBaseline => self.clear_baseline(),
             // Deferred to later MVP-2 phases: surface feedback instead of a silent
-            // no-op, matching the RPC stubs' "not yet implemented". P1 replaces the
-            // baseline arms with real mutation; P4 wires up sessions.
-            LocalAction::SetBaseline(_) | LocalAction::ClearBaseline | LocalAction::OpenSessions => {
+            // no-op, matching the RPC stubs' "not yet implemented". P4 wires up
+            // sessions.
+            LocalAction::OpenSessions => {
                 self.banner = Some("not yet implemented".into());
             }
             // Overlay/modal opens are performed by the loop, not by state.
@@ -1159,6 +1162,21 @@ mod tests {
         app.apply_local(LocalAction::OpenTxBuilder);
         app.apply_local(LocalAction::OpenSessions);
         // No state assertion beyond "did not panic"; P1 fills baseline behavior.
+    }
+
+    #[test]
+    fn apply_local_sets_and_clears_baseline() {
+        let mut app = AppState::new();
+        app.push_column(column(42, 1, 1));
+        // SetBaseline(None) pins the current tip.
+        app.apply_local(LocalAction::SetBaseline(None));
+        assert_eq!(app.baseline, Some(42));
+        // SetBaseline(Some(n)) pins an explicit number.
+        app.apply_local(LocalAction::SetBaseline(Some(7)));
+        assert_eq!(app.baseline, Some(7));
+        // ClearBaseline reverts.
+        app.apply_local(LocalAction::ClearBaseline);
+        assert_eq!(app.baseline, None);
     }
 
     #[test]
