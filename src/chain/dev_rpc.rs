@@ -35,6 +35,7 @@ use subxt_signer::sr25519::{Keypair, dev};
 use crate::contracts::{
     BlockRef, BuildMode, DevAccount, EventSummary, PreparedTx, Result, TxOutcome, TxSigner,
 };
+use crate::session::TimeSpec;
 
 /// Build one block via `dev_newBlock` and report the new head as a `BlockRef`.
 ///
@@ -83,6 +84,40 @@ pub(crate) async fn set_storage(rpc: &RpcClient, edits: serde_json::Value) -> Re
     // `dev_setStorage` returns the resulting block hash (hex string); we only
     // care that the call succeeds.
     let _hash: String = rpc.request("dev_setStorage", rpc_params_from(params)).await?;
+    Ok(())
+}
+
+/// Build the single JSON argument for `dev_setHead` (the target block number).
+fn set_head_arg(block: u32) -> serde_json::Value {
+    serde_json::json!(block)
+}
+
+/// Build the single JSON argument for `dev_timeTravel` (absolute unix epoch ms).
+fn time_travel_arg(spec: &TimeSpec) -> serde_json::Value {
+    serde_json::json!(spec.epoch_ms)
+}
+
+/// Re-fork the chain head to `block` via `dev_setHead`.
+///
+/// Chopsticks discards every block after the new head and rebuilds forward from
+/// there; the caller (P4) snapshots the abandoned future first (spec §7.1).
+///
+/// Integration-tested only (live RPC), per this module's validation policy.
+pub(crate) async fn set_head(rpc: &RpcClient, block: u32) -> Result<()> {
+    let _: serde_json::Value = rpc
+        .request("dev_setHead", rpc_params![set_head_arg(block)])
+        .await?;
+    Ok(())
+}
+
+/// Set the chain timestamp via `dev_timeTravel`; subsequent blocks advance from
+/// there (spec §7.2). The argument is absolute unix epoch ms.
+///
+/// Integration-tested only (live RPC), per this module's validation policy.
+pub(crate) async fn time_travel(rpc: &RpcClient, spec: &TimeSpec) -> Result<()> {
+    let _: serde_json::Value = rpc
+        .request("dev_timeTravel", rpc_params![time_travel_arg(spec)])
+        .await?;
     Ok(())
 }
 
@@ -313,6 +348,34 @@ mod tests {
         let params = set_storage_params(&edits);
         assert_eq!(params.len(), 1);
         assert_eq!(params[0], edits);
+    }
+
+    #[test]
+    fn set_head_arg_is_the_block_number() {
+        assert_eq!(set_head_arg(1030), serde_json::json!(1030));
+    }
+
+    #[test]
+    fn time_travel_arg_is_epoch_ms_number() {
+        let spec = crate::session::TimeSpec::from_epoch_ms(1_750_000_000_000u64, "test");
+        assert_eq!(time_travel_arg(&spec), serde_json::json!(1_750_000_000_000u64));
+    }
+
+    /// Live: requires a running Chopsticks fork on `ws://localhost:8000`.
+    /// Run with `cargo test --lib -- --ignored set_head_and_time_travel_live`.
+    #[tokio::test]
+    #[ignore = "requires a live Chopsticks fork"]
+    async fn set_head_and_time_travel_live() {
+        let rpc = RpcClient::from_url("ws://localhost:8000").await.unwrap();
+        // Build two blocks, rewind to the first, then advance time by a day.
+        let first = new_block(&rpc).await.unwrap();
+        let _second = new_block(&rpc).await.unwrap();
+        set_head(&rpc, first.number).await.unwrap();
+        let spec = crate::session::TimeSpec::from_epoch_ms(
+            crate::session::now_ms() + 86_400_000,
+            "+1d",
+        );
+        time_travel(&rpc, &spec).await.unwrap();
     }
 
     #[test]
