@@ -226,6 +226,8 @@ pub struct TxBuilder<C: CallCatalog> {
     // Call selection.
     pallet_index: usize,
     call_index: usize,
+    /// Fuzzy filter for the active Pallet/Call list (reset on stage change).
+    filter: String,
 
     // Argument form: one input buffer per arg of the selected call, plus the
     // index of the field being edited.
@@ -241,6 +243,21 @@ pub struct TxBuilder<C: CallCatalog> {
     staged: Option<PreparedTx>,
 }
 
+/// Case-insensitive subsequence ("fuzzy") match: every char of `needle` must
+/// appear in `haystack` in order. Mirrors the storage picker's matcher.
+fn fuzzy_match(haystack: &str, needle: &str) -> bool {
+    let mut hay = haystack.chars().map(|c| c.to_ascii_lowercase());
+    'next: for nc in needle.chars().map(|c| c.to_ascii_lowercase()) {
+        for hc in hay.by_ref() {
+            if hc == nc {
+                continue 'next;
+            }
+        }
+        return false;
+    }
+    true
+}
+
 impl<C: CallCatalog> TxBuilder<C> {
     /// Build a fresh overlay over the given catalog. Defaults to dev `Alice` and
     /// the first pallet/call the catalog reports.
@@ -253,6 +270,7 @@ impl<C: CallCatalog> TxBuilder<C> {
             impersonate_input: String::new(),
             pallet_index: 0,
             call_index: 0,
+            filter: String::new(),
             arg_inputs: Vec::new(),
             arg_field: 0,
             result: None,
@@ -278,13 +296,41 @@ impl<C: CallCatalog> TxBuilder<C> {
 
     // -- derived selection -------------------------------------------------
 
+    /// Pallets surviving the current filter (all when the filter is empty). The
+    /// filter is cleared on stage transitions, so it only narrows while the
+    /// Pallet list is focused.
+    fn filtered_pallets(&self) -> Vec<String> {
+        let all = self.catalog.pallets();
+        // The filter only narrows the list whose stage is focused; the selection
+        // is committed to a full-list index on transition (see commit_*).
+        if self.focus != Focus::Pallet || self.filter.is_empty() {
+            return all;
+        }
+        all.into_iter()
+            .filter(|p| fuzzy_match(p, &self.filter))
+            .collect()
+    }
+
+    /// Calls of the selected pallet surviving the current filter.
+    fn filtered_calls(&self) -> Vec<String> {
+        let Some(pallet) = self.current_pallet() else {
+            return Vec::new();
+        };
+        let all = self.catalog.calls(&pallet);
+        if self.focus != Focus::Call || self.filter.is_empty() {
+            return all;
+        }
+        all.into_iter()
+            .filter(|c| fuzzy_match(c, &self.filter))
+            .collect()
+    }
+
     fn current_pallet(&self) -> Option<String> {
-        self.catalog.pallets().into_iter().nth(self.pallet_index)
+        self.filtered_pallets().into_iter().nth(self.pallet_index)
     }
 
     fn current_call(&self) -> Option<String> {
-        let pallet = self.current_pallet()?;
-        self.catalog.calls(&pallet).into_iter().nth(self.call_index)
+        self.filtered_calls().into_iter().nth(self.call_index)
     }
 
     fn current_arg_specs(&self) -> Vec<ArgSpec> {
@@ -448,7 +494,7 @@ impl<C: CallCatalog> TxBuilder<C> {
     }
 
     fn on_key_pallet(&mut self, key: KeyEvent) {
-        let len = self.catalog.pallets().len().max(1);
+        let len = self.filtered_pallets().len().max(1);
         match key.code {
             KeyCode::Up => {
                 self.pallet_index = (self.pallet_index + len - 1) % len;
@@ -460,18 +506,47 @@ impl<C: CallCatalog> TxBuilder<C> {
                 self.call_index = 0;
                 self.sync_arg_inputs();
             }
-            KeyCode::Enter => self.focus = Focus::Call,
-            KeyCode::Esc => self.focus = Focus::Signer,
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.pallet_index = 0;
+                self.call_index = 0;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.pallet_index = 0;
+                self.call_index = 0;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Enter => {
+                // Pin the filtered selection to its full-list index, then drop the
+                // filter so the Call stage starts unfiltered.
+                self.commit_pallet_selection();
+                self.filter.clear();
+                self.call_index = 0;
+                self.focus = Focus::Call;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Esc => {
+                self.filter.clear();
+                self.focus = Focus::Signer;
+            }
             _ => {}
         }
     }
 
+    /// Resolve the currently-selected (possibly filtered) pallet to its index in
+    /// the full pallet list, so the selection survives clearing the filter.
+    fn commit_pallet_selection(&mut self) {
+        if let Some(name) = self.current_pallet()
+            && let Some(i) = self.catalog.pallets().iter().position(|p| *p == name)
+        {
+            self.pallet_index = i;
+        }
+    }
+
     fn on_key_call(&mut self, key: KeyEvent) {
-        let len = self
-            .current_pallet()
-            .map(|p| self.catalog.calls(&p).len())
-            .unwrap_or(0)
-            .max(1);
+        let len = self.filtered_calls().len().max(1);
         match key.code {
             KeyCode::Up => {
                 self.call_index = (self.call_index + len - 1) % len;
@@ -481,9 +556,37 @@ impl<C: CallCatalog> TxBuilder<C> {
                 self.call_index = (self.call_index + 1) % len;
                 self.sync_arg_inputs();
             }
-            KeyCode::Enter => self.focus = Focus::Args,
-            KeyCode::Esc => self.focus = Focus::Pallet,
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.call_index = 0;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.call_index = 0;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Enter => {
+                self.commit_call_selection();
+                self.filter.clear();
+                self.focus = Focus::Args;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Esc => {
+                self.filter.clear();
+                self.focus = Focus::Pallet;
+            }
             _ => {}
+        }
+    }
+
+    /// Resolve the selected (possibly filtered) call to its index in the pallet's
+    /// full call list, so the selection survives clearing the filter.
+    fn commit_call_selection(&mut self) {
+        if let (Some(pallet), Some(name)) = (self.current_pallet(), self.current_call())
+            && let Some(i) = self.catalog.calls(&pallet).iter().position(|c| *c == name)
+        {
+            self.call_index = i;
         }
     }
 
@@ -605,8 +708,8 @@ impl<C: CallCatalog> TxBuilder<C> {
             ])
             .split(area);
 
-        // Pallets.
-        let pallets = self.catalog.pallets();
+        // Pallets (filtered while the Pallet list is focused).
+        let pallets = self.filtered_pallets();
         let pallet_items: Vec<ListItem> = pallets
             .iter()
             .enumerate()
@@ -616,17 +719,14 @@ impl<C: CallCatalog> TxBuilder<C> {
             List::new(pallet_items).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Pallet")
+                    .title(self.list_title("Pallet", Focus::Pallet))
                     .border_style(self.border_style(Focus::Pallet)),
             ),
             cols[0],
         );
 
-        // Calls.
-        let calls = self
-            .current_pallet()
-            .map(|p| self.catalog.calls(&p))
-            .unwrap_or_default();
+        // Calls (filtered while the Call list is focused).
+        let calls = self.filtered_calls();
         let call_items: Vec<ListItem> = calls
             .iter()
             .enumerate()
@@ -636,7 +736,7 @@ impl<C: CallCatalog> TxBuilder<C> {
             List::new(call_items).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Call")
+                    .title(self.list_title("Call", Focus::Call))
                     .border_style(self.border_style(Focus::Call)),
             ),
             cols[1],
@@ -725,6 +825,16 @@ impl<C: CallCatalog> TxBuilder<C> {
             }
         };
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
+    }
+
+    /// A list block title that appends the live fuzzy filter while that list is
+    /// focused (e.g. `Pallet  /bal`), so the user sees what they're typing.
+    fn list_title(&self, label: &str, focus: Focus) -> String {
+        if self.focus == focus && !self.filter.is_empty() {
+            format!("{label}  /{}", self.filter)
+        } else {
+            label.to_string()
+        }
     }
 
     fn border_style(&self, focus: Focus) -> Style {
@@ -831,6 +941,64 @@ mod tests {
                 bytes: vec![0xab, 0xcd],
             }))
         }
+    }
+
+    /// A catalog with several pallets/calls for exercising the fuzzy filter.
+    struct ManyCatalog;
+    impl CallCatalog for ManyCatalog {
+        fn pallets(&self) -> Vec<String> {
+            vec![
+                "Assets".into(),
+                "Balances".into(),
+                "System".into(),
+                "Timestamp".into(),
+            ]
+        }
+        fn calls(&self, pallet: &str) -> Vec<String> {
+            match pallet {
+                "Balances" => vec![
+                    "transfer_keep_alive".into(),
+                    "transfer_all".into(),
+                    "force_transfer".into(),
+                ],
+                _ => vec!["noop".into()],
+            }
+        }
+        fn args(&self, _p: &str, _c: &str) -> Vec<ArgSpec> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn pallet_filter_narrows_selection() {
+        let mut b = TxBuilder::new(ManyCatalog);
+        b.on_key(key(KeyCode::Enter)); // Signer -> Pallet
+        type_into(&mut b, "sys");
+        assert_eq!(b.current_pallet().as_deref(), Some("System"));
+        // Backspacing widens the filter again; selection falls back to the first.
+        b.on_key(key(KeyCode::Backspace));
+        b.on_key(key(KeyCode::Backspace));
+        b.on_key(key(KeyCode::Backspace));
+        assert_eq!(b.current_pallet().as_deref(), Some("Assets"));
+    }
+
+    #[test]
+    fn call_filter_narrows_within_pallet() {
+        let mut b = TxBuilder::new(ManyCatalog);
+        b.on_key(key(KeyCode::Enter)); // Signer -> Pallet
+        type_into(&mut b, "Balances");
+        b.on_key(key(KeyCode::Enter)); // Pallet -> Call (filter resets)
+        type_into(&mut b, "force");
+        assert_eq!(b.current_call().as_deref(), Some("force_transfer"));
+    }
+
+    #[test]
+    fn entering_call_stage_resets_the_filter() {
+        let mut b = TxBuilder::new(ManyCatalog);
+        b.on_key(key(KeyCode::Enter)); // Signer -> Pallet
+        type_into(&mut b, "Bal"); // narrow pallets
+        b.on_key(key(KeyCode::Enter)); // -> Call; filter must reset so all calls show
+        assert_eq!(b.current_call().as_deref(), Some("transfer_keep_alive"));
     }
 
     /// Type a string into any builder (generic over the catalog).
