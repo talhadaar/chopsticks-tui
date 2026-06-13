@@ -89,6 +89,41 @@ pub(crate) async fn fetch(
     }
 }
 
+/// Compute the `0x`-hex hashed storage key for a pinned item, fully offline
+/// against the loaded `metadata`. Mirrors the address + `fetch_key` path used in
+/// [`fetch`] but needs no network round-trip: `subxt::Metadata` implements
+/// `frame_decode::storage::StorageTypeInfo`, so the same key bytes can be
+/// produced from metadata + the encodable key parts alone (P2).
+pub(crate) fn storage_key_hex(metadata: &subxt::Metadata, item: &PinnedItem) -> Result<String> {
+    use subxt::ext::frame_decode::storage::encode_storage_key;
+
+    let bytes = encode_storage_key(
+        &item.pallet,
+        &item.entry,
+        key_parts(&item.keys),
+        metadata,
+        metadata.types(),
+    )
+    .map_err(|e| anyhow::anyhow!("derive storage key for {}.{}: {e}", item.pallet, item.entry))?;
+    Ok(hex_of(&bytes))
+}
+
+/// Look up the value type-id for a pallet's storage entry from loaded metadata
+/// (offline; mirrors [`entry_value_ty`] but takes a bare `Metadata`). Used by the
+/// set-storage editor to encode the new value against the entry's value type-id.
+pub(crate) fn entry_value_type_id(metadata: &subxt::Metadata, pallet: &str, entry: &str) -> Result<u32> {
+    let pallet_meta = metadata
+        .pallet_by_name(pallet)
+        .ok_or_else(|| anyhow::anyhow!("pallet {pallet} not found in metadata"))?;
+    let storage = pallet_meta
+        .storage()
+        .ok_or_else(|| anyhow::anyhow!("pallet {pallet} has no storage"))?;
+    let entry_meta = storage
+        .entry_by_name(entry)
+        .ok_or_else(|| anyhow::anyhow!("storage entry {pallet}.{entry} not found"))?;
+    Ok(entry_meta.value_ty())
+}
+
 /// Look up the value type-id for a pallet's storage entry from block metadata.
 fn entry_value_ty<C>(
     at_block: &subxt::client::ClientAtBlock<PolkadotConfig, C>,
