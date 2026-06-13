@@ -9,6 +9,9 @@ async-trait = "0.1.89"
 crossterm = "0.29.0"
 futures = "0.3.32"
 ratatui = "0.30.1"
+# Version pinned to match what subxt 0.50.1 pulls (see Cargo.lock) so the
+# `PortableRegistry` types unify across the crate boundary.
+scale-info = { version = "2.11.6", features = ["derive"] }
 scale-value = "0.18.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -17,8 +20,3 @@ subxt-signer = "0.50.1"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 toml = "0.8.19"
-
-[dev-dependencies]
-# Used only by set-storage encoding tests to build an offline type registry.
-# Version pinned to match what subxt 0.50.1 pulls (see Cargo.lock).
-scale-info = { version = "2.11.6", features = ["derive"] }

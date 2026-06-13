@@ -37,7 +37,8 @@ use crate::views::grid::{GridCell, GridRow, GridView, GridViewModel};
 use crate::views::picker::StoragePicker;
 use crate::views::set_storage::{SetStorageEditor, ValueMode};
 use crate::views::build_panel::{BuildPanel, PanelAction};
-use crate::views::tx_builder::{ArgKind, ArgSpec, CallCatalog, TxBuilder};
+use crate::views::call_catalog::MetadataCallCatalog;
+use crate::views::tx_builder::TxBuilder;
 use crate::app::input::{KeyRouting, Mode, route_key};
 use crate::views::command_registry::{CommandRoute, LocalAction, parse_line, to_route};
 use crate::views::hint_bar::render_hint_bar;
@@ -608,39 +609,6 @@ fn default_ctx() -> RenderCtx {
 // Call catalog for the tx builder
 // ---------------------------------------------------------------------------
 
-/// A small curated set of dispatchable calls for the MVP transaction builder.
-///
-/// NOTE: this is intentionally a hand-picked catalog covering the common
-/// balance/remark flows rather than a full metadata-driven enumeration. A
-/// metadata-backed `CallCatalog` (walking the runtime's call enums) is a tracked
-/// follow-up; it is orthogonal to the orchestration this ticket delivers.
-pub struct CuratedCallCatalog;
-
-impl CallCatalog for CuratedCallCatalog {
-    fn pallets(&self) -> Vec<String> {
-        vec!["Balances".into(), "System".into()]
-    }
-
-    fn calls(&self, pallet: &str) -> Vec<String> {
-        match pallet {
-            "Balances" => vec!["transfer_keep_alive".into(), "transfer_allow_death".into()],
-            "System" => vec!["remark".into()],
-            _ => vec![],
-        }
-    }
-
-    fn args(&self, pallet: &str, call: &str) -> Vec<ArgSpec> {
-        match (pallet, call) {
-            ("Balances", "transfer_keep_alive") | ("Balances", "transfer_allow_death") => vec![
-                ArgSpec::new("dest", ArgKind::AccountId),
-                ArgSpec::new("value", ArgKind::U128),
-            ],
-            ("System", "remark") => vec![ArgSpec::new("remark", ArgKind::Text)],
-            _ => vec![],
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Event loop
 // ---------------------------------------------------------------------------
@@ -678,7 +646,7 @@ async fn run_async(mut terminal: DefaultTerminal) -> Result<()> {
     let mut client: Option<&'static SubxtChainClient> = None;
     let mut catalog: Option<&'static MetadataCatalog<'static>> = None;
     let mut picker: Option<StoragePicker<'static>> = None;
-    let mut tx_builder: Option<TxBuilder<CuratedCallCatalog>> = None;
+    let mut tx_builder: Option<TxBuilder<MetadataCallCatalog<'static>>> = None;
     let mut set_storage_editor: Option<SetStorageEditor<'static>> = None;
     let mut build_panel: Option<BuildPanel> = None;
     let mut sessions: Option<crate::views::sessions::SessionsView> = None;
@@ -783,7 +751,7 @@ fn handle_key(
     app: &mut AppState,
     cmd_tx: &mpsc::UnboundedSender<Command>,
     picker: &mut Option<StoragePicker<'static>>,
-    tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+    tx_builder: &mut Option<TxBuilder<MetadataCallCatalog<'static>>>,
     set_storage_editor: &mut Option<SetStorageEditor<'static>>,
     build_panel: &mut Option<BuildPanel>,
     sessions: &mut Option<crate::views::sessions::SessionsView>,
@@ -850,8 +818,10 @@ fn handle_key(
             }
         }
         KeyRouting::OpenTxBuilder => {
-            *tx_builder = Some(TxBuilder::new(CuratedCallCatalog));
-            app.mode = Mode::Insert;
+            if let Some(cat) = catalog {
+                *tx_builder = Some(TxBuilder::new(MetadataCallCatalog::new(cat.metadata)));
+                app.mode = Mode::Insert;
+            }
         }
         KeyRouting::Grid(key) => {
             // `S` opens the sessions modal (standalone fallback before/besides the
@@ -879,7 +849,7 @@ fn handle_key(
             );
         }
         KeyRouting::Overlay(key) => {
-            handle_overlay_key(key, app, cmd_tx, picker, tx_builder, build_panel);
+            handle_overlay_key(key, app, cmd_tx, picker, tx_builder, build_panel, catalog);
         }
     }
 }
@@ -892,7 +862,7 @@ fn handle_palette_key(
     app: &mut AppState,
     cmd_tx: &mpsc::UnboundedSender<Command>,
     picker: &mut Option<StoragePicker<'static>>,
-    tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+    tx_builder: &mut Option<TxBuilder<MetadataCallCatalog<'static>>>,
     set_storage_editor: &mut Option<SetStorageEditor<'static>>,
     build_panel: &mut Option<BuildPanel>,
     sessions: &mut Option<crate::views::sessions::SessionsView>,
@@ -930,8 +900,13 @@ fn handle_palette_key(
                             }
                         }
                         LocalAction::OpenTxBuilder => {
-                            *tx_builder = Some(TxBuilder::new(CuratedCallCatalog));
-                            app.mode = Mode::Insert;
+                            if let Some(cat) = catalog {
+                                *tx_builder =
+                                    Some(TxBuilder::new(MetadataCallCatalog::new(cat.metadata)));
+                                app.mode = Mode::Insert;
+                            } else {
+                                app.banner = Some("tx: not connected".into());
+                            }
                         }
                         LocalAction::OpenSetStorage => {
                             if let (Some(c), Some(cat)) = (client, catalog) {
@@ -965,8 +940,9 @@ fn handle_overlay_key(
     app: &mut AppState,
     cmd_tx: &mpsc::UnboundedSender<Command>,
     picker: &mut Option<StoragePicker<'static>>,
-    tx_builder: &mut Option<TxBuilder<CuratedCallCatalog>>,
+    tx_builder: &mut Option<TxBuilder<MetadataCallCatalog<'static>>>,
     build_panel: &mut Option<BuildPanel>,
+    catalog: Option<&'static MetadataCatalog<'static>>,
 ) {
     if let Some(p) = picker.as_mut() {
         if key.code == KeyCode::Esc {
@@ -1013,8 +989,11 @@ fn handle_overlay_key(
             PanelAction::None => {}
             PanelAction::AddExtrinsic => {
                 // Open the tx-builder in Stage mode on top of the panel; its
-                // completed tx is drained back into the panel above.
-                *tx_builder = Some(TxBuilder::new_staging(CuratedCallCatalog));
+                // completed tx is drained back into the panel above. Needs the
+                // runtime metadata catalog (only present once connected).
+                if let Some(cat) = catalog {
+                    *tx_builder = Some(TxBuilder::new_staging(MetadataCallCatalog::new(cat.metadata)));
+                }
             }
             PanelAction::Build { queue, timestamp, author } => {
                 // Action-log append seam (freeze §4): record the P3 built block here
@@ -1421,7 +1400,7 @@ fn render(
     app: &AppState,
     renderer: &dyn crate::contracts::ValueRenderer,
     picker: Option<&StoragePicker<'static>>,
-    tx_builder: Option<&TxBuilder<CuratedCallCatalog>>,
+    tx_builder: Option<&TxBuilder<MetadataCallCatalog<'static>>>,
     set_storage_editor: Option<&SetStorageEditor<'static>>,
     build_panel: Option<&BuildPanel>,
     sessions: Option<&crate::views::sessions::SessionsView>,

@@ -3,6 +3,7 @@
 //! RPC directly.
 
 pub mod build_panel;
+pub mod call_catalog;
 pub mod command_registry;
 pub mod connection;
 pub mod grid;

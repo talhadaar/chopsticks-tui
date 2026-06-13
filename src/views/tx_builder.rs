@@ -37,6 +37,11 @@ pub enum ArgKind {
     AccountId,
     /// Free-form text / bytes.
     Text,
+    /// An arbitrary value entered as scale-value text (e.g. `Some(1)`,
+    /// `{ id: 5 }`, `Variant(...)`), parsed via `scale_value::stringify`. Used
+    /// for call args whose type is not one of the friendly primitives above; the
+    /// concrete metadata type-id lives on the [`ArgSpec`].
+    Scale,
 }
 
 impl ArgKind {
@@ -59,6 +64,14 @@ impl ArgKind {
                 .map(|id| Value::from_bytes(id.0))
                 .map_err(|_| format!("`{trimmed}` is not a valid SS58 address")),
             ArgKind::Text => Ok(Value::string(trimmed.to_string())),
+            ArgKind::Scale => {
+                let (parsed, rest) = scale_value::stringify::from_str(trimmed);
+                let value = parsed.map_err(|e| format!("`{trimmed}` is not a valid value: {e}"))?;
+                if !rest.trim().is_empty() {
+                    return Err(format!("trailing input after value: `{}`", rest.trim()));
+                }
+                Ok(value)
+            }
         }
     }
 }
@@ -68,19 +81,45 @@ impl ArgKind {
 pub struct ArgSpec {
     pub name: String,
     pub kind: ArgKind,
+    /// The argument's runtime metadata type-id, when known (metadata-backed
+    /// catalog). `None` for catalogs without metadata; encoding then falls back
+    /// to the non-validated preview.
+    pub type_id: Option<u32>,
 }
 
 impl ArgSpec {
+    /// A spec with no known metadata type-id (legacy / mock catalogs).
     pub fn new(name: impl Into<String>, kind: ArgKind) -> Self {
         Self {
             name: name.into(),
             kind,
+            type_id: None,
+        }
+    }
+
+    /// A spec carrying the argument's runtime metadata type-id.
+    pub fn typed(name: impl Into<String>, kind: ArgKind, type_id: u32) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            type_id: Some(type_id),
         }
     }
 }
 
-/// A browsable view over the runtime's dispatchable calls. The real impl (T12 /
-/// metadata) wraps subxt metadata; tests inject a hand-rolled catalog.
+/// The result of validating + encoding a call's arguments against runtime
+/// metadata: the submission-ready values (possibly coerced, e.g. an AccountId
+/// wrapped in `MultiAddress::Id`) and the SCALE-encoded arg bytes for preview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncodedCall {
+    /// Submission-ready arg values, index-aligned with the call's args.
+    pub args: Vec<Value<()>>,
+    /// SCALE bytes of the encoded arguments (for the preview panel).
+    pub bytes: Vec<u8>,
+}
+
+/// A browsable view over the runtime's dispatchable calls. The metadata-backed
+/// impl wraps subxt metadata; tests inject a hand-rolled catalog.
 pub trait CallCatalog {
     /// Pallet names that expose at least one call, in display order.
     fn pallets(&self) -> Vec<String>;
@@ -88,6 +127,19 @@ pub trait CallCatalog {
     fn calls(&self, pallet: &str) -> Vec<String>;
     /// Ordered argument specs for a `pallet.call`.
     fn args(&self, pallet: &str, call: &str) -> Vec<ArgSpec>;
+    /// Validate + coerce parsed `args` for `pallet.call` against their runtime
+    /// types, returning submission-ready values and the encoded arg bytes.
+    /// `Ok(None)` means the catalog has no metadata (mock/legacy) and the caller
+    /// should keep the raw args with a cosmetic preview. `Err` is a per-arg
+    /// encode failure and blocks submission. Default: `Ok(None)`.
+    fn encode_call(
+        &self,
+        _pallet: &str,
+        _call: &str,
+        _args: &[Value<()>],
+    ) -> std::result::Result<Option<EncodedCall>, String> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +226,8 @@ pub struct TxBuilder<C: CallCatalog> {
     // Call selection.
     pallet_index: usize,
     call_index: usize,
+    /// Fuzzy filter for the active Pallet/Call list (reset on stage change).
+    filter: String,
 
     // Argument form: one input buffer per arg of the selected call, plus the
     // index of the field being edited.
@@ -189,6 +243,21 @@ pub struct TxBuilder<C: CallCatalog> {
     staged: Option<PreparedTx>,
 }
 
+/// Case-insensitive subsequence ("fuzzy") match: every char of `needle` must
+/// appear in `haystack` in order. Mirrors the storage picker's matcher.
+fn fuzzy_match(haystack: &str, needle: &str) -> bool {
+    let mut hay = haystack.chars().map(|c| c.to_ascii_lowercase());
+    'next: for nc in needle.chars().map(|c| c.to_ascii_lowercase()) {
+        for hc in hay.by_ref() {
+            if hc == nc {
+                continue 'next;
+            }
+        }
+        return false;
+    }
+    true
+}
+
 impl<C: CallCatalog> TxBuilder<C> {
     /// Build a fresh overlay over the given catalog. Defaults to dev `Alice` and
     /// the first pallet/call the catalog reports.
@@ -201,6 +270,7 @@ impl<C: CallCatalog> TxBuilder<C> {
             impersonate_input: String::new(),
             pallet_index: 0,
             call_index: 0,
+            filter: String::new(),
             arg_inputs: Vec::new(),
             arg_field: 0,
             result: None,
@@ -226,13 +296,41 @@ impl<C: CallCatalog> TxBuilder<C> {
 
     // -- derived selection -------------------------------------------------
 
+    /// Pallets surviving the current filter (all when the filter is empty). The
+    /// filter is cleared on stage transitions, so it only narrows while the
+    /// Pallet list is focused.
+    fn filtered_pallets(&self) -> Vec<String> {
+        let all = self.catalog.pallets();
+        // The filter only narrows the list whose stage is focused; the selection
+        // is committed to a full-list index on transition (see commit_*).
+        if self.focus != Focus::Pallet || self.filter.is_empty() {
+            return all;
+        }
+        all.into_iter()
+            .filter(|p| fuzzy_match(p, &self.filter))
+            .collect()
+    }
+
+    /// Calls of the selected pallet surviving the current filter.
+    fn filtered_calls(&self) -> Vec<String> {
+        let Some(pallet) = self.current_pallet() else {
+            return Vec::new();
+        };
+        let all = self.catalog.calls(&pallet);
+        if self.focus != Focus::Call || self.filter.is_empty() {
+            return all;
+        }
+        all.into_iter()
+            .filter(|c| fuzzy_match(c, &self.filter))
+            .collect()
+    }
+
     fn current_pallet(&self) -> Option<String> {
-        self.catalog.pallets().into_iter().nth(self.pallet_index)
+        self.filtered_pallets().into_iter().nth(self.pallet_index)
     }
 
     fn current_call(&self) -> Option<String> {
-        let pallet = self.current_pallet()?;
-        self.catalog.calls(&pallet).into_iter().nth(self.call_index)
+        self.filtered_calls().into_iter().nth(self.call_index)
     }
 
     fn current_arg_specs(&self) -> Vec<ArgSpec> {
@@ -315,8 +413,26 @@ impl<C: CallCatalog> TxBuilder<C> {
         let call = self
             .current_call()
             .ok_or_else(|| "no call selected".to_string())?;
-        let args = self.parse_args()?;
-        let encoded_preview = format!("{}  {}", self.encoded_hex(&args), self.decoded_summary(&args));
+        let raw_args = self.parse_args()?;
+        // Metadata-backed catalogs validate + coerce args against the real types
+        // (e.g. wrapping an AccountId into `MultiAddress::Id`) and yield real
+        // encoded bytes; an encode failure here blocks submission. Catalogs
+        // without metadata return `None` and we keep the cosmetic preview.
+        let (args, encoded_preview) = match self.catalog.encode_call(&pallet, &call, &raw_args)? {
+            Some(enc) => {
+                let mut hex = String::from("0x");
+                for b in &enc.bytes {
+                    let _ = write!(hex, "{b:02x}");
+                }
+                let preview = format!("{hex}  {}", self.decoded_summary(&enc.args));
+                (enc.args, preview)
+            }
+            None => {
+                let preview =
+                    format!("{}  {}", self.encoded_hex(&raw_args), self.decoded_summary(&raw_args));
+                (raw_args, preview)
+            }
+        };
         Ok(PreparedTx {
             pallet,
             call,
@@ -378,7 +494,7 @@ impl<C: CallCatalog> TxBuilder<C> {
     }
 
     fn on_key_pallet(&mut self, key: KeyEvent) {
-        let len = self.catalog.pallets().len().max(1);
+        let len = self.filtered_pallets().len().max(1);
         match key.code {
             KeyCode::Up => {
                 self.pallet_index = (self.pallet_index + len - 1) % len;
@@ -390,18 +506,47 @@ impl<C: CallCatalog> TxBuilder<C> {
                 self.call_index = 0;
                 self.sync_arg_inputs();
             }
-            KeyCode::Enter => self.focus = Focus::Call,
-            KeyCode::Esc => self.focus = Focus::Signer,
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.pallet_index = 0;
+                self.call_index = 0;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.pallet_index = 0;
+                self.call_index = 0;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Enter => {
+                // Pin the filtered selection to its full-list index, then drop the
+                // filter so the Call stage starts unfiltered.
+                self.commit_pallet_selection();
+                self.filter.clear();
+                self.call_index = 0;
+                self.focus = Focus::Call;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Esc => {
+                self.filter.clear();
+                self.focus = Focus::Signer;
+            }
             _ => {}
         }
     }
 
+    /// Resolve the currently-selected (possibly filtered) pallet to its index in
+    /// the full pallet list, so the selection survives clearing the filter.
+    fn commit_pallet_selection(&mut self) {
+        if let Some(name) = self.current_pallet()
+            && let Some(i) = self.catalog.pallets().iter().position(|p| *p == name)
+        {
+            self.pallet_index = i;
+        }
+    }
+
     fn on_key_call(&mut self, key: KeyEvent) {
-        let len = self
-            .current_pallet()
-            .map(|p| self.catalog.calls(&p).len())
-            .unwrap_or(0)
-            .max(1);
+        let len = self.filtered_calls().len().max(1);
         match key.code {
             KeyCode::Up => {
                 self.call_index = (self.call_index + len - 1) % len;
@@ -411,9 +556,37 @@ impl<C: CallCatalog> TxBuilder<C> {
                 self.call_index = (self.call_index + 1) % len;
                 self.sync_arg_inputs();
             }
-            KeyCode::Enter => self.focus = Focus::Args,
-            KeyCode::Esc => self.focus = Focus::Pallet,
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.call_index = 0;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.call_index = 0;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Enter => {
+                self.commit_call_selection();
+                self.filter.clear();
+                self.focus = Focus::Args;
+                self.sync_arg_inputs();
+            }
+            KeyCode::Esc => {
+                self.filter.clear();
+                self.focus = Focus::Pallet;
+            }
             _ => {}
+        }
+    }
+
+    /// Resolve the selected (possibly filtered) call to its index in the pallet's
+    /// full call list, so the selection survives clearing the filter.
+    fn commit_call_selection(&mut self) {
+        if let (Some(pallet), Some(name)) = (self.current_pallet(), self.current_call())
+            && let Some(i) = self.catalog.calls(&pallet).iter().position(|c| *c == name)
+        {
+            self.call_index = i;
         }
     }
 
@@ -535,8 +708,8 @@ impl<C: CallCatalog> TxBuilder<C> {
             ])
             .split(area);
 
-        // Pallets.
-        let pallets = self.catalog.pallets();
+        // Pallets (filtered while the Pallet list is focused).
+        let pallets = self.filtered_pallets();
         let pallet_items: Vec<ListItem> = pallets
             .iter()
             .enumerate()
@@ -546,17 +719,14 @@ impl<C: CallCatalog> TxBuilder<C> {
             List::new(pallet_items).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Pallet")
+                    .title(self.list_title("Pallet", Focus::Pallet))
                     .border_style(self.border_style(Focus::Pallet)),
             ),
             cols[0],
         );
 
-        // Calls.
-        let calls = self
-            .current_pallet()
-            .map(|p| self.catalog.calls(&p))
-            .unwrap_or_default();
+        // Calls (filtered while the Call list is focused).
+        let calls = self.filtered_calls();
         let call_items: Vec<ListItem> = calls
             .iter()
             .enumerate()
@@ -566,7 +736,7 @@ impl<C: CallCatalog> TxBuilder<C> {
             List::new(call_items).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Call")
+                    .title(self.list_title("Call", Focus::Call))
                     .border_style(self.border_style(Focus::Call)),
             ),
             cols[1],
@@ -657,6 +827,16 @@ impl<C: CallCatalog> TxBuilder<C> {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
     }
 
+    /// A list block title that appends the live fuzzy filter while that list is
+    /// focused (e.g. `Pallet  /bal`), so the user sees what they're typing.
+    fn list_title(&self, label: &str, focus: Focus) -> String {
+        if self.focus == focus && !self.filter.is_empty() {
+            format!("{label}  /{}", self.filter)
+        } else {
+            label.to_string()
+        }
+    }
+
     fn border_style(&self, focus: Focus) -> Style {
         if self.focus == focus {
             Style::default().fg(Color::Cyan)
@@ -713,6 +893,153 @@ mod tests {
                 _ => vec![],
             }
         }
+    }
+
+    /// A catalog whose `encode_call` always fails (mimics a metadata-backed
+    /// catalog rejecting an arg).
+    struct EncErrCatalog;
+    impl CallCatalog for EncErrCatalog {
+        fn pallets(&self) -> Vec<String> {
+            vec!["P".into()]
+        }
+        fn calls(&self, _p: &str) -> Vec<String> {
+            vec!["c".into()]
+        }
+        fn args(&self, _p: &str, _c: &str) -> Vec<ArgSpec> {
+            vec![ArgSpec::typed("x", ArgKind::U128, 0)]
+        }
+        fn encode_call(
+            &self,
+            _p: &str,
+            _c: &str,
+            _args: &[Value<()>],
+        ) -> std::result::Result<Option<EncodedCall>, String> {
+            Err("x: cannot encode".into())
+        }
+    }
+
+    /// A catalog whose `encode_call` returns coerced args + sentinel bytes.
+    struct EncOkCatalog;
+    impl CallCatalog for EncOkCatalog {
+        fn pallets(&self) -> Vec<String> {
+            vec!["P".into()]
+        }
+        fn calls(&self, _p: &str) -> Vec<String> {
+            vec!["c".into()]
+        }
+        fn args(&self, _p: &str, _c: &str) -> Vec<ArgSpec> {
+            vec![ArgSpec::typed("dest", ArgKind::AccountId, 0)]
+        }
+        fn encode_call(
+            &self,
+            _p: &str,
+            _c: &str,
+            _args: &[Value<()>],
+        ) -> std::result::Result<Option<EncodedCall>, String> {
+            Ok(Some(EncodedCall {
+                args: vec![Value::unnamed_variant("Id", [Value::u128(1)])],
+                bytes: vec![0xab, 0xcd],
+            }))
+        }
+    }
+
+    /// A catalog with several pallets/calls for exercising the fuzzy filter.
+    struct ManyCatalog;
+    impl CallCatalog for ManyCatalog {
+        fn pallets(&self) -> Vec<String> {
+            vec![
+                "Assets".into(),
+                "Balances".into(),
+                "System".into(),
+                "Timestamp".into(),
+            ]
+        }
+        fn calls(&self, pallet: &str) -> Vec<String> {
+            match pallet {
+                "Balances" => vec![
+                    "transfer_keep_alive".into(),
+                    "transfer_all".into(),
+                    "force_transfer".into(),
+                ],
+                _ => vec!["noop".into()],
+            }
+        }
+        fn args(&self, _p: &str, _c: &str) -> Vec<ArgSpec> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn pallet_filter_narrows_selection() {
+        let mut b = TxBuilder::new(ManyCatalog);
+        b.on_key(key(KeyCode::Enter)); // Signer -> Pallet
+        type_into(&mut b, "sys");
+        assert_eq!(b.current_pallet().as_deref(), Some("System"));
+        // Backspacing widens the filter again; selection falls back to the first.
+        b.on_key(key(KeyCode::Backspace));
+        b.on_key(key(KeyCode::Backspace));
+        b.on_key(key(KeyCode::Backspace));
+        assert_eq!(b.current_pallet().as_deref(), Some("Assets"));
+    }
+
+    #[test]
+    fn call_filter_narrows_within_pallet() {
+        let mut b = TxBuilder::new(ManyCatalog);
+        b.on_key(key(KeyCode::Enter)); // Signer -> Pallet
+        type_into(&mut b, "Balances");
+        b.on_key(key(KeyCode::Enter)); // Pallet -> Call (filter resets)
+        type_into(&mut b, "force");
+        assert_eq!(b.current_call().as_deref(), Some("force_transfer"));
+    }
+
+    #[test]
+    fn entering_call_stage_resets_the_filter() {
+        let mut b = TxBuilder::new(ManyCatalog);
+        b.on_key(key(KeyCode::Enter)); // Signer -> Pallet
+        type_into(&mut b, "Bal"); // narrow pallets
+        b.on_key(key(KeyCode::Enter)); // -> Call; filter must reset so all calls show
+        assert_eq!(b.current_call().as_deref(), Some("transfer_keep_alive"));
+    }
+
+    /// Type a string into any builder (generic over the catalog).
+    fn type_into<C: CallCatalog>(b: &mut TxBuilder<C>, s: &str) {
+        for c in s.chars() {
+            b.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    /// Advance a single-arg builder from Signer to a filled Args field.
+    fn fill_single_arg<C: CallCatalog>(b: &mut TxBuilder<C>, value: &str) {
+        b.on_key(key(KeyCode::Enter)); // Signer -> Pallet
+        b.on_key(key(KeyCode::Enter)); // Pallet -> Call
+        b.on_key(key(KeyCode::Enter)); // Call -> Args
+        type_into(b, value);
+    }
+
+    #[test]
+    fn submit_blocked_when_catalog_encode_fails() {
+        let mut b = TxBuilder::new(EncErrCatalog);
+        fill_single_arg(&mut b, "5");
+        assert!(
+            b.on_key(key(KeyCode::Enter)).is_none(),
+            "an encode failure must block submit"
+        );
+        assert!(b.build_prepared().is_err(), "build_prepared surfaces the encode error");
+    }
+
+    #[test]
+    fn build_prepared_uses_coerced_args_and_real_hex_preview() {
+        let mut b = TxBuilder::new(EncOkCatalog);
+        fill_single_arg(&mut b, "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY");
+        let tx = b.build_prepared().expect("prepared");
+        // The submitted args come from encode_call (coerced), not the raw parse.
+        assert_eq!(tx.args, vec![Value::unnamed_variant("Id", [Value::u128(1)])]);
+        // The preview carries the real encoded hex.
+        assert!(
+            tx.encoded_preview.contains("abcd"),
+            "real encoded hex must appear in the preview: {}",
+            tx.encoded_preview
+        );
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -826,6 +1153,27 @@ mod tests {
         assert!(b.parse_args().is_err());
         // Submit must NOT emit when args are invalid.
         assert!(b.on_key(key(KeyCode::Enter)).is_none());
+    }
+
+    #[test]
+    fn arg_kind_scale_parses_text_into_value_and_rejects_garbage() {
+        // A bare integer is valid scale-value text → an unsigned primitive.
+        let v = ArgKind::Scale
+            .parse("12345")
+            .expect("integer parses as scale-value text");
+        assert_eq!(v, Value::u128(12345));
+        // A variant expression parses too.
+        assert!(ArgKind::Scale.parse("Some(1)").is_ok(), "variant expr parses");
+        // Garbage is rejected.
+        assert!(ArgKind::Scale.parse("(((").is_err(), "garbage rejected");
+    }
+
+    #[test]
+    fn arg_spec_carries_optional_type_id() {
+        // The legacy constructor defaults to no type-id.
+        assert_eq!(ArgSpec::new("x", ArgKind::U128).type_id, None);
+        // The typed constructor records the metadata type-id.
+        assert_eq!(ArgSpec::typed("x", ArgKind::Scale, 42).type_id, Some(42));
     }
 
     #[test]
