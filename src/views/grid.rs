@@ -159,7 +159,8 @@ impl Widget for GridView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let model = self.model;
 
-        // Header: block numbers, newest on the right, plus a follow badge.
+        // Header: block numbers, newest on the right, plus a follow badge and
+        // (when active) a coexisting purple baseline badge.
         let badge = if model.follow { "FOLLOW" } else { "PAUSED" };
         let badge_style = if model.follow {
             Style::default()
@@ -172,14 +173,54 @@ impl Widget for GridView<'_> {
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         };
-        let title = Line::from(vec![
+
+        let mut title_spans = vec![
             Span::raw("Storage grid "),
             Span::styled(format!(" {badge} "), badge_style),
-        ]);
+        ];
+        // Baseline badge (purple), coexisting with FOLLOW/PAUSED.
+        if model.baseline_state != BaselineState::Off {
+            let label = match model.baseline_state {
+                BaselineState::Live => {
+                    format!(" ★ BASELINE #{} ", model.baseline_block.unwrap_or(0))
+                }
+                BaselineState::Pending => {
+                    format!(" ★ BASELINE #{} (pending) ", model.baseline_block.unwrap_or(0))
+                }
+                BaselineState::Evicted => {
+                    format!(" ★ BASELINE #{} (gone) ", model.baseline_block.unwrap_or(0))
+                }
+                BaselineState::Off => unreachable!("guarded by the != Off check"),
+            };
+            title_spans.push(Span::raw(" "));
+            title_spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let title = Line::from(title_spans);
         let block = Block::bordered().title(title);
 
-        // Header cells: blank gutter label, then each block number.
-        let header_cells = std::iter::once(Cell::from("item")).chain(
+        // Whether to draw the frozen baseline anchor column on the far left.
+        let frozen = model.baseline_column.as_ref();
+        let divider_style = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
+
+        // Header cells: gutter label, then (optional) frozen baseline header +
+        // purple divider, then each live block number.
+        let mut header_cells: Vec<Cell> = vec![Cell::from("item")];
+        if frozen.is_some() {
+            header_cells.push(
+                Cell::from(format!("★#{}", model.baseline_block.unwrap_or(0)))
+                    .style(divider_style),
+            );
+            header_cells.push(Cell::from("║").style(divider_style));
+        }
+        header_cells.extend(
             model
                 .columns
                 .iter()
@@ -189,20 +230,37 @@ impl Widget for GridView<'_> {
             .style(Style::default().add_modifier(Modifier::BOLD))
             .bottom_margin(0);
 
-        // Body rows: apply the vertical scroll offset.
-        let body_rows = model.rows.iter().skip(model.scroll).map(|row| {
+        // Body rows: apply the vertical scroll offset. Each row gets the same
+        // optional frozen-cell + divider prefix as the header.
+        let body_rows = model.rows.iter().enumerate().skip(model.scroll).map(|(i, row)| {
             let label = Cell::from(Span::styled(
                 row.label.clone(),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
-            let cells = row.cells.iter().map(|c| {
-                Cell::from(Self::cell_text(c)).style(Self::cell_style(&c.diff))
-            });
-            Row::new(std::iter::once(label).chain(cells))
+            let mut cells: Vec<Cell> = vec![label];
+            if let Some(frozen_cells) = frozen {
+                let fc = frozen_cells
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| GridCell::text(""));
+                cells.push(Cell::from(Self::cell_text(&fc)).style(Self::cell_style(&fc.diff)));
+                cells.push(Cell::from("║").style(divider_style));
+            }
+            cells.extend(
+                row.cells
+                    .iter()
+                    .map(|c| Cell::from(Self::cell_text(c)).style(Self::cell_style(&c.diff))),
+            );
+            Row::new(cells)
         });
 
-        let mut widths = Vec::with_capacity(model.columns.len() + 1);
+        // Widths: gutter, then (optional) frozen col + divider, then live cols.
+        let mut widths = Vec::with_capacity(model.columns.len() + 3);
         widths.push(ratatui::layout::Constraint::Length(LABEL_WIDTH));
+        if frozen.is_some() {
+            widths.push(ratatui::layout::Constraint::Length(COL_WIDTH));
+            widths.push(ratatui::layout::Constraint::Length(1)); // divider
+        }
         widths.extend(
             model
                 .columns
@@ -383,6 +441,77 @@ mod tests {
         let paused = buffer_text(&render(&model, 80, 8));
         assert!(paused.contains("PAUSED"), "expected PAUSED badge");
         assert!(!paused.contains("FOLLOW"), "unexpected FOLLOW badge");
+    }
+
+    #[test]
+    fn baseline_badge_coexists_with_follow() {
+        let mut model = model_with(
+            vec![GridRow {
+                label: "row".to_string(),
+                cells: vec![GridCell::text("x")],
+            }],
+            vec![1043],
+        );
+        model.follow = true;
+        model.baseline_block = Some(1042);
+        model.baseline_state = BaselineState::Live;
+        let text = buffer_text(&render(&model, 100, 8));
+        assert!(text.contains("FOLLOW"), "FOLLOW badge must still show");
+        assert!(text.contains("BASELINE #1042"), "baseline badge must show #n");
+        assert!(text.contains("★"), "baseline badge must show the star glyph");
+    }
+
+    #[test]
+    fn baseline_badge_shows_pending_and_gone() {
+        let mut model = model_with(
+            vec![GridRow {
+                label: "row".to_string(),
+                cells: vec![GridCell::text("x")],
+            }],
+            vec![1043],
+        );
+        model.baseline_block = Some(2000);
+        model.baseline_state = BaselineState::Pending;
+        let pending = buffer_text(&render(&model, 100, 8));
+        assert!(pending.contains("pending"), "pending baseline must be flagged");
+
+        model.baseline_state = BaselineState::Evicted;
+        let gone = buffer_text(&render(&model, 100, 8));
+        assert!(gone.contains("gone"), "evicted baseline must be flagged");
+    }
+
+    #[test]
+    fn frozen_baseline_column_renders_with_divider() {
+        let mut model = model_with(
+            vec![GridRow {
+                label: "row".to_string(),
+                cells: vec![GridCell::text("now")],
+            }],
+            vec![1099],
+        );
+        model.baseline_block = Some(1042);
+        model.baseline_state = BaselineState::Live;
+        // Frozen column: one cell per row, anchored left.
+        model.baseline_column = Some(vec![GridCell::text("base")]);
+        let text = buffer_text(&render(&model, 120, 8));
+        assert!(text.contains("base"), "frozen baseline cell value must render");
+        assert!(text.contains("║"), "purple divider must render");
+        // The frozen header marks the baseline block.
+        assert!(text.contains("★#1042"), "frozen column header must mark the baseline");
+    }
+
+    #[test]
+    fn no_baseline_renders_no_badge_or_divider() {
+        let model = model_with(
+            vec![GridRow {
+                label: "row".to_string(),
+                cells: vec![GridCell::text("x")],
+            }],
+            vec![1],
+        );
+        let text = buffer_text(&render(&model, 100, 8));
+        assert!(!text.contains("BASELINE"), "no baseline → no badge");
+        assert!(!text.contains("║"), "no baseline → no divider");
     }
 
     #[test]
